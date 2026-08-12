@@ -105,6 +105,17 @@ for improved position estimation.
 #define ANCHOR_MIN_TX_FREQ 20.0f
 #define ID_COUNT 256
 
+// Number of simultaneously logged TWR distances in hybrid mode. Sized for the
+// swarm-encirclement use case: three template anchors plus a leader and a
+// follower, with one slot spare.
+#define HM_LOG_SLOTS 6
+
+// A logged distance older than this is considered stale and is reported as
+// exactly 0.0 m. Without this the log variable would silently retain the last
+// value measured for a remote that has since stopped responding, which is
+// indistinguishable from a valid reading.
+#define HM_LOG_MAX_AGE_MS 500
+
 // Short LPP packets for position
 #define SHORT_LPP 0xF0
 #define LPP_SHORT_ANCHOR_POSITION 0x01
@@ -199,6 +210,13 @@ static struct {
   // Logging of hybrid mode distances
   uint8_t logDistAnchorId;
   float logDistance;
+
+  // Multi-slot logging of hybrid mode distances. Each slot tracks the TWR
+  // distance to one configurable remote id, so several ranges (for instance
+  // three anchors plus two neighbouring Crazyflies) can be logged at once.
+  uint8_t logDistIds[HM_LOG_SLOTS];
+  float logDistances[HM_LOG_SLOTS];
+  uint32_t logDistUpdated_ms[HM_LOG_SLOTS];
 #endif
 } ctx;
 
@@ -348,8 +366,18 @@ static void processTwoWayRanging(tdoaAnchorContext_t* anchorCtx, const uint32_t 
         float distance = SPEED_OF_LIGHT * (tof_T - LOCODECK_ANTENNA_DELAY) / LOCODECK_TS_FREQ;
         tdoaStorageSetTimeOfFlight(anchorCtx, tof_T, now_ms);
 
-        if (tdoaStorageGetId(anchorCtx) == ctx.logDistAnchorId) {
+        const uint8_t remoteId = tdoaStorageGetId(anchorCtx);
+
+        if (remoteId == ctx.logDistAnchorId) {
           ctx.logDistance = distance;
+        }
+
+        // Update every logging slot configured for this remote id.
+        for (int i = 0; i < HM_LOG_SLOTS; i++) {
+          if (ctx.logDistIds[i] == remoteId) {
+            ctx.logDistances[i] = distance;
+            ctx.logDistUpdated_ms[i] = now_ms;
+          }
         }
 
         point_t position;
@@ -367,6 +395,25 @@ static void processTwoWayRanging(tdoaAnchorContext_t* anchorCtx, const uint32_t 
             STATS_CNT_RATE_EVENT(&ctx.cntTwrToEstimator);
           }
         }
+      }
+    }
+  }
+}
+
+/**
+ * Zero any logged distance that has not been refreshed recently.
+ *
+ * ctx.logDistances[] is only written when a two-way exchange completes for the
+ * configured id. If a remote stops responding, or the slot is configured for an
+ * id that is not present, the entry would otherwise keep its last value forever
+ * and read as a plausible measurement. Reporting 0.0 makes "no data" explicit,
+ * since a genuine range is never exactly zero.
+ */
+static void ageOutLoggedDistances(const uint32_t now_ms) {
+  for (int i = 0; i < HM_LOG_SLOTS; i++) {
+    if (ctx.logDistances[i] != 0.0f) {
+      if ((now_ms - ctx.logDistUpdated_ms[i]) > HM_LOG_MAX_AGE_MS) {
+        ctx.logDistances[i] = 0.0f;
       }
     }
   }
@@ -566,6 +613,8 @@ static uint32_t startNextEvent(dwDevice_t *dev, const uint32_t now) {
   bool isTxPending = sendLpp(dev);
 
 #ifdef CONFIG_DECK_LOCO_TDOA3_HYBRID_MODE
+  ageOutLoggedDistances(T2M(now));
+
   if (ctx.isTwrActive) {
     if (!isTxPending) {
       if (ctx.nextTxTick < now) {
@@ -681,6 +730,14 @@ static void Initialize(dwDevice_t *dev) {
   ctx.useTwrForPositionEstimation = false;
   ctx.maxAgeOfTof_ms = 200;
 
+  // Default each logging slot to the id matching its index, so ids 0..5 are
+  // logged out of the box. Override per slot with the hmLId0..hmLId5 params.
+  for (int i = 0; i < HM_LOG_SLOTS; i++) {
+    ctx.logDistIds[i] = i;
+    ctx.logDistances[i] = 0.0f;
+    ctx.logDistUpdated_ms[i] = 0;
+  }
+
   ctx.averageTxDelay = 1000.0f / ANCHOR_MAX_TX_FREQ;
   ctx.nextTxDelayEvaluationTime_ms = 0;
 
@@ -729,6 +786,36 @@ LOG_GROUP_START(tdoa3)
    * @brief Measured distance to the anchor selected by the tdoa3.hmAnchLog parameter in hybrid mode [m]
    */
   LOG_ADD(LOG_FLOAT, hmDist, &ctx.logDistance)
+
+  /**
+   * @brief Measured distance to the remote id in hmLId0 [m]. 0.0 means no recent measurement.
+   */
+  LOG_ADD(LOG_FLOAT, hmD0, &ctx.logDistances[0])
+
+  /**
+   * @brief Measured distance to the remote id in hmLId1 [m]. 0.0 means no recent measurement.
+   */
+  LOG_ADD(LOG_FLOAT, hmD1, &ctx.logDistances[1])
+
+  /**
+   * @brief Measured distance to the remote id in hmLId2 [m]. 0.0 means no recent measurement.
+   */
+  LOG_ADD(LOG_FLOAT, hmD2, &ctx.logDistances[2])
+
+  /**
+   * @brief Measured distance to the remote id in hmLId3 [m]. 0.0 means no recent measurement.
+   */
+  LOG_ADD(LOG_FLOAT, hmD3, &ctx.logDistances[3])
+
+  /**
+   * @brief Measured distance to the remote id in hmLId4 [m]. 0.0 means no recent measurement.
+   */
+  LOG_ADD(LOG_FLOAT, hmD4, &ctx.logDistances[4])
+
+  /**
+   * @brief Measured distance to the remote id in hmLId5 [m]. 0.0 means no recent measurement.
+   */
+  LOG_ADD(LOG_FLOAT, hmD5, &ctx.logDistances[5])
 LOG_GROUP_STOP(tdoa3)
 #endif
 
@@ -783,5 +870,37 @@ PARAM_ADD(PARAM_FLOAT, stddev, &ctx.tdoaStdDev)
    * @brief The measurement noise to use when sending TWR measurements to the estimator in hybrid mode
    */
   PARAM_ADD(PARAM_FLOAT, twrStd, &ctx.twrStdDev)
+
+  /**
+   * @brief Remote id whose distance is reported in the tdoa3.hmD0 log variable.
+   * Unlike hmAnchLog these slots are independent, so several distances (for
+   * instance three anchors plus a leader and a follower) can be logged at once.
+   */
+  PARAM_ADD(PARAM_UINT8, hmLId0, &ctx.logDistIds[0])
+
+  /**
+   * @brief Remote id whose distance is reported in the tdoa3.hmD1 log variable.
+   */
+  PARAM_ADD(PARAM_UINT8, hmLId1, &ctx.logDistIds[1])
+
+  /**
+   * @brief Remote id whose distance is reported in the tdoa3.hmD2 log variable.
+   */
+  PARAM_ADD(PARAM_UINT8, hmLId2, &ctx.logDistIds[2])
+
+  /**
+   * @brief Remote id whose distance is reported in the tdoa3.hmD3 log variable.
+   */
+  PARAM_ADD(PARAM_UINT8, hmLId3, &ctx.logDistIds[3])
+
+  /**
+   * @brief Remote id whose distance is reported in the tdoa3.hmD4 log variable.
+   */
+  PARAM_ADD(PARAM_UINT8, hmLId4, &ctx.logDistIds[4])
+
+  /**
+   * @brief Remote id whose distance is reported in the tdoa3.hmD5 log variable.
+   */
+  PARAM_ADD(PARAM_UINT8, hmLId5, &ctx.logDistIds[5])
 #endif
 PARAM_GROUP_STOP(tdoa3)
