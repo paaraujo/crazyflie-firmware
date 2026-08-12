@@ -40,6 +40,7 @@ docs/api
 
 build/
 .cache/
+cache/
 /compile_commands.json
 # To avoid that /tools/build is ignored
 !/tools/*
