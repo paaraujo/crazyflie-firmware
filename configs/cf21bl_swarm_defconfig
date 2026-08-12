@@ -1,0 +1,31 @@
+#
+# Crazyflie 2.1 Brushless configured for UWB swarm-encirclement work.
+#
+# Same as cf21bl_defconfig, plus the Loco settings the swarm tooling needs:
+#
+#   DECK_LOCO_ALGORITHM_TDOA3    pin the ranging algorithm instead of letting
+#                                AUTO detect it, so the mode is deterministic
+#                                and cannot silently differ between drones.
+#
+#   DECK_LOCO_TDOA3_HYBRID_MODE  let the Crazyflie transmit and do two-way
+#                                ranging inside the TDoA3 protocol. This is what
+#                                provides the tdoa3.hm* params and log variables
+#                                (hmTwr, hmD0..hmD5, hmLId0..hmLId5) used by
+#                                tools/swarm/. Anchors must run in TDoA3 mode.
+#
+# Build with:
+#     make cf21bl_swarm_defconfig
+#     make -j$(nproc)
+#
+# Use this instead of hand-editing build/.config: `make cf21bl_defconfig`
+# rewrites the config from platform defaults and silently drops the Loco
+# settings, producing a binary with no tdoa3.hm* parameters at all.
+#
+
+CONFIG_PLATFORM_CF21BL=y
+
+CONFIG_MOTORS_REQUIRE_ARMING=y
+CONFIG_MOTORS_ESC_PROTOCOL_DSHOT=y
+
+CONFIG_DECK_LOCO_ALGORITHM_TDOA3=y
+CONFIG_DECK_LOCO_TDOA3_HYBRID_MODE=y
