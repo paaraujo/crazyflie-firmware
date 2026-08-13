@@ -54,6 +54,8 @@ CONFIG = {
     'tdoa3.hmTofAge': 200,
     'tdoa3.stddev': 0.1,
     'tdoa3.twrStd': 0.1,
+    'tdoa3.hmOutTh': 0.5,     # drop TWR ranges with >50cm error
+    'tdoa3.hmMaxReply': 0
 }
 
 

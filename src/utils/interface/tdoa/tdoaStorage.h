@@ -10,7 +10,10 @@
 #define TOF_PER_ANCHOR_COUNT 16
 
 #ifdef CONFIG_DECK_LOCO_TDOA3_HYBRID_MODE
-#define TWR_HISTORY_LENGTH 32
+// Window of the median outlier filter for TWR distances. At the typical ~50 Hz
+// per-remote update rate, 9 samples spans ~180 ms, which rejects gross outliers
+// while keeping the lag small enough to track a moving Crazyflie.
+#define TWR_HISTORY_LENGTH 9
 #define TWR_OUTLIER_TH 4
 #endif
 
@@ -46,6 +49,13 @@ typedef struct {
   #ifdef CONFIG_DECK_LOCO_TDOA3_HYBRID_MODE
   uint64_t tof;
   uint32_t tofTime_ms;
+
+  // Rolling history of accepted TWR distances, used by the median outlier
+  // filter in lpsTdoa3Tag.c. A median is used rather than a mean/stddev so a
+  // single gross outlier cannot poison the statistic that rejects it.
+  float twrHistory[TWR_HISTORY_LENGTH];
+  uint8_t twrHistoryCount;
+  uint8_t twrHistoryIndex;
   #endif
 } tdoaAnchorInfo_t;
 

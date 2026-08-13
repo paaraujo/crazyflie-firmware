@@ -217,6 +217,17 @@ static struct {
   uint8_t logDistIds[HM_LOG_SLOTS];
   float logDistances[HM_LOG_SLOTS];
   uint32_t logDistUpdated_ms[HM_LOG_SLOTS];
+
+  // TWR sample rejection. Both thresholds are disabled when set to 0.
+  float twrMaxReply_ms;   // reject samples whose reply time exceeds this
+  float twrOutlierTh_m;   // reject samples this far from the recent median
+
+  // Diagnostics for the most recent TWR sample, for tuning the thresholds.
+  float logReplyTimes[HM_LOG_SLOTS];  // per slot, recorded before rejection
+  float logReplyTime_ms;
+  float logClockCorrPpm;
+  statsCntRateLogger_t cntTwrRejReply;
+  statsCntRateLogger_t cntTwrRejOutlier;
 #endif
 } ctx;
 
@@ -345,6 +356,66 @@ static void setRadioInReceiveMode(dwDevice_t *dev) {
 
 #ifdef CONFIG_DECK_LOCO_TDOA3_HYBRID_MODE
 
+/**
+ * Median of the accepted TWR distance history for one remote.
+ *
+ * A median is deliberately used instead of the mean/stddev test that earlier
+ * versions of this file carried: a single gross outlier (which is exactly what
+ * we are trying to reject) shifts a mean and inflates a stddev, so the very
+ * statistic used for rejection is corrupted by the sample being tested. The
+ * median is unaffected by up to half the window being bad.
+ */
+static float twrHistoryMedian(const tdoaAnchorInfo_t* info) {
+  float sorted[TWR_HISTORY_LENGTH];
+  const uint8_t n = info->twrHistoryCount;
+
+  for (uint8_t i = 0; i < n; i++) {
+    sorted[i] = info->twrHistory[i];
+  }
+
+  // Insertion sort; n is small (TWR_HISTORY_LENGTH) and this runs at the
+  // per-remote ranging rate, so the cost is negligible.
+  for (uint8_t i = 1; i < n; i++) {
+    const float key = sorted[i];
+    int8_t j = i - 1;
+    while (j >= 0 && sorted[j] > key) {
+      sorted[j + 1] = sorted[j];
+      j--;
+    }
+    sorted[j + 1] = key;
+  }
+
+  return sorted[n / 2];
+}
+
+/**
+ * Reject TWR distances that deviate too far from the recent median.
+ *
+ * The history is only advanced with accepted samples, so a burst of outliers
+ * cannot drag the reference away from the true distance.
+ */
+static bool twrOutlierFilter(tdoaAnchorContext_t* anchorCtx, const float distance) {
+  tdoaAnchorInfo_t* info = anchorCtx->anchorInfo;
+
+  // Until the window is populated, accept everything so the filter can converge.
+  if (info->twrHistoryCount < TWR_HISTORY_LENGTH) {
+    info->twrHistory[info->twrHistoryIndex] = distance;
+    info->twrHistoryIndex = (info->twrHistoryIndex + 1) % TWR_HISTORY_LENGTH;
+    info->twrHistoryCount++;
+    return true;
+  }
+
+  const float median = twrHistoryMedian(info);
+  const bool accepted = fabsf(distance - median) < ctx.twrOutlierTh_m;
+
+  if (accepted) {
+    info->twrHistory[info->twrHistoryIndex] = distance;
+    info->twrHistoryIndex = (info->twrHistoryIndex + 1) % TWR_HISTORY_LENGTH;
+  }
+
+  return accepted;
+}
+
 static void processTwoWayRanging(tdoaAnchorContext_t* anchorCtx, const uint32_t now_ms, const uint64_t txAn_in_cl_An, const uint64_t rxAn_by_T_in_cl_T) {
   // We assume updateRemoteData() has been called before this function
   // and that the remote data from the current packet is in the storage, as we read data from the storage.
@@ -364,6 +435,45 @@ static void processTwoWayRanging(tdoaAnchorContext_t* anchorCtx, const uint32_t 
         int64_t tof_T = (t_since_tx_T - t_in_anchor_T) / 2;
 
         float distance = SPEED_OF_LIGHT * (tof_T - LOCODECK_ANTENNA_DELAY) / LOCODECK_TS_FREQ;
+
+        // The reply time is measured in the REMOTE's clock and rescaled by
+        // clockCorrection, so any clock error is amplified in proportion to it:
+        //     range error = c * (clock correction error) * t_reply / 2
+        // At 1 ppm that is ~3 m per 20 ms of reply time. Anchors transmit
+        // steadily and reply quickly; Crazyflies use a randomised, contended TX
+        // schedule, so their replies are later and more variable. Rejecting long
+        // replies removes the samples where clock error dominates.
+        const float replyTime_ms = 1000.0f * (float)t_in_anchor_T / (float)LOCODECK_TS_FREQ;
+        ctx.logReplyTime_ms = replyTime_ms;
+        ctx.logClockCorrPpm = (float)((clockCorrection - 1.0) * 1e6);
+
+        // Record the reply time per logging slot BEFORE the accept/reject
+        // decision, so the diagnostic shows the full distribution including the
+        // samples that get rejected. This is what makes it possible to compare
+        // anchor reply times against Crazyflie-to-Crazyflie reply times.
+        {
+          const uint8_t id = tdoaStorageGetId(anchorCtx);
+          for (int i = 0; i < HM_LOG_SLOTS; i++) {
+            if (ctx.logDistIds[i] == id) {
+              ctx.logReplyTimes[i] = replyTime_ms;
+            }
+          }
+        }
+
+        bool accepted = true;
+
+        if (ctx.twrMaxReply_ms > 0.0f && replyTime_ms > ctx.twrMaxReply_ms) {
+          accepted = false;
+          STATS_CNT_RATE_EVENT(&ctx.cntTwrRejReply);
+        } else if (ctx.twrOutlierTh_m > 0.0f && !twrOutlierFilter(anchorCtx, distance)) {
+          accepted = false;
+          STATS_CNT_RATE_EVENT(&ctx.cntTwrRejOutlier);
+        }
+
+        if (!accepted) {
+          return;
+        }
+
         tdoaStorageSetTimeOfFlight(anchorCtx, tof_T, now_ms);
 
         const uint8_t remoteId = tdoaStorageGetId(anchorCtx);
@@ -736,7 +846,18 @@ static void Initialize(dwDevice_t *dev) {
     ctx.logDistIds[i] = i;
     ctx.logDistances[i] = 0.0f;
     ctx.logDistUpdated_ms[i] = 0;
+    ctx.logReplyTimes[i] = 0.0f;
   }
+
+  // Start with rejection disabled so behaviour is unchanged until the
+  // thresholds are deliberately set; tune with hmMaxReply and hmOutTh.
+  ctx.twrMaxReply_ms = 0.0f;
+  ctx.twrOutlierTh_m = 0.0f;
+  ctx.logReplyTime_ms = 0.0f;
+  ctx.logClockCorrPpm = 0.0f;
+
+  STATS_CNT_RATE_INIT(&ctx.cntTwrRejReply, STATS_INTERVAL);
+  STATS_CNT_RATE_INIT(&ctx.cntTwrRejOutlier, STATS_INTERVAL);
 
   ctx.averageTxDelay = 1000.0f / ANCHOR_MAX_TX_FREQ;
   ctx.nextTxDelayEvaluationTime_ms = 0;
@@ -816,6 +937,49 @@ LOG_GROUP_START(tdoa3)
    * @brief Measured distance to the remote id in hmLId5 [m]. 0.0 means no recent measurement.
    */
   LOG_ADD(LOG_FLOAT, hmD5, &ctx.logDistances[5])
+
+  /**
+   * @brief Reply time of the most recent TWR sample [ms]. Long replies amplify
+   * clock correction error into large range errors.
+   */
+  LOG_ADD(LOG_FLOAT, hmRepT, &ctx.logReplyTime_ms)
+
+  /**
+   * @brief Reply time for the remote in hmLId0 [ms]. Recorded even for samples
+   * that are subsequently rejected, so the full distribution is visible.
+   */
+  LOG_ADD(LOG_FLOAT, hmRT0, &ctx.logReplyTimes[0])
+
+  /** @brief Reply time for the remote in hmLId1 [ms] */
+  LOG_ADD(LOG_FLOAT, hmRT1, &ctx.logReplyTimes[1])
+
+  /** @brief Reply time for the remote in hmLId2 [ms] */
+  LOG_ADD(LOG_FLOAT, hmRT2, &ctx.logReplyTimes[2])
+
+  /** @brief Reply time for the remote in hmLId3 [ms] */
+  LOG_ADD(LOG_FLOAT, hmRT3, &ctx.logReplyTimes[3])
+
+  /** @brief Reply time for the remote in hmLId4 [ms] */
+  LOG_ADD(LOG_FLOAT, hmRT4, &ctx.logReplyTimes[4])
+
+  /** @brief Reply time for the remote in hmLId5 [ms] */
+  LOG_ADD(LOG_FLOAT, hmRT5, &ctx.logReplyTimes[5])
+
+  /**
+   * @brief Clock correction of the most recent TWR sample, as deviation from
+   * unity [ppm].
+   */
+  LOG_ADD(LOG_FLOAT, hmCcPpm, &ctx.logClockCorrPpm)
+
+  /**
+   * @brief Rate of TWR samples rejected for having too long a reply time [1/s]
+   */
+  STATS_CNT_RATE_LOG_ADD(hmRejR, &ctx.cntTwrRejReply)
+
+  /**
+   * @brief Rate of TWR samples rejected by the median outlier filter [1/s]
+   */
+  STATS_CNT_RATE_LOG_ADD(hmRejO, &ctx.cntTwrRejOutlier)
 LOG_GROUP_STOP(tdoa3)
 #endif
 
@@ -902,5 +1066,21 @@ PARAM_ADD(PARAM_FLOAT, stddev, &ctx.tdoaStdDev)
    * @brief Remote id whose distance is reported in the tdoa3.hmD5 log variable.
    */
   PARAM_ADD(PARAM_UINT8, hmLId5, &ctx.logDistIds[5])
+
+  /**
+   * @brief Reject TWR samples whose reply time exceeds this [ms]. 0 disables.
+   *
+   * Clock correction error is amplified in proportion to the reply time
+   * (roughly 3 m of range error per ppm per 20 ms), so late replies carry most
+   * of the gross outliers. Crazyflie-to-Crazyflie links are affected far more
+   * than anchors because their transmit schedule is randomised and contended.
+   */
+  PARAM_ADD(PARAM_FLOAT, hmMaxReply, &ctx.twrMaxReply_ms)
+
+  /**
+   * @brief Reject TWR samples deviating more than this [m] from the recent
+   * median distance to that remote. 0 disables.
+   */
+  PARAM_ADD(PARAM_FLOAT, hmOutTh, &ctx.twrOutlierTh_m)
 #endif
 PARAM_GROUP_STOP(tdoa3)

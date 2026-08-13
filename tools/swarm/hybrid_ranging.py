@@ -109,31 +109,143 @@ def apply_config(scf):
 
 
 def collect(scf, duration_s):
-    """Log all six distance slots plus the rate counters, concurrently."""
-    dist_rows, rate_rows = [], []
+    """Log distances, per-slot reply times, and the rate counters concurrently."""
+    dist_rows, reply_rows, rate_rows = [], [], []
 
     lg_d = LogConfig(name='hmDist', period_in_ms=100)
     for s in range(HM_LOG_SLOTS):
         lg_d.add_variable(f'tdoa3.hmD{s}', 'float')
 
+    # Reply time per slot. Recorded by the firmware BEFORE the accept/reject
+    # decision, so rejected samples appear here too.
+    lg_t = LogConfig(name='hmReply', period_in_ms=100)
+    for s in range(HM_LOG_SLOTS):
+        lg_t.add_variable(f'tdoa3.hmRT{s}', 'float')
+
     lg_r = LogConfig(name='hmRate', period_in_ms=200)
-    for v in ('tdoa3.hmTx', 'tdoa3.hmSeqOk', 'tdoa3.hmEst'):
+    for v in ('tdoa3.hmTx', 'tdoa3.hmSeqOk', 'tdoa3.hmEst',
+              'tdoa3.hmRejR', 'tdoa3.hmRejO', 'tdoa3.hmCcPpm'):
         lg_r.add_variable(v, 'float')
 
-    scf.cf.log.add_config(lg_d)
-    scf.cf.log.add_config(lg_r)
-    lg_d.data_received_cb.add_callback(lambda t, d, l: dist_rows.append(d))
-    lg_r.data_received_cb.add_callback(lambda t, d, l: rate_rows.append(d))
+    for cfg, sink in ((lg_d, dist_rows), (lg_t, reply_rows), (lg_r, rate_rows)):
+        scf.cf.log.add_config(cfg)
+        cfg.data_received_cb.add_callback(lambda t, d, l, s=sink: s.append(d))
 
     print(f'collecting for {duration_s:.0f} s ...')
-    lg_d.start()
-    lg_r.start()
+    for cfg in (lg_d, lg_t, lg_r):
+        cfg.start()
     time.sleep(duration_s)
-    lg_d.stop()
-    lg_r.stop()
-    print(f'  {len(dist_rows)} distance samples, {len(rate_rows)} rate samples\n')
+    for cfg in (lg_d, lg_t, lg_r):
+        cfg.stop()
+    print(f'  {len(dist_rows)} distance, {len(reply_rows)} reply, '
+          f'{len(rate_rows)} rate samples\n')
 
-    return dist_rows, rate_rows
+    return dist_rows, reply_rows, rate_rows
+
+
+def percentile(values, p):
+    """Linear-interpolated percentile; avoids a numpy dependency."""
+    if not values:
+        return float('nan')
+    s = sorted(values)
+    if len(s) == 1:
+        return s[0]
+    k = (len(s) - 1) * p / 100.0
+    lo, hi = int(k), min(int(k) + 1, len(s) - 1)
+    return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+
+def reply_report(reply_rows):
+    """Compare reply-time distributions per remote.
+
+    The hypothesis under test: clock-correction error is amplified by the reply
+    time (~3 m of range error per ppm per 20 ms), so Crazyflie-to-Crazyflie
+    links -- which have a randomised, contended transmit schedule -- should show
+    markedly longer replies than anchors, and that is where the outliers live.
+    """
+    print('reply time per remote [ms] -- long replies amplify clock error')
+    print(f'{"id":>4} {"slot":>5} | {"median":>8} {"p90":>8} {"p99":>8} {"max":>8}')
+    print('-' * 50)
+
+    stats = {}
+    for slot, remote in enumerate(IDS):
+        vals = [r[f'tdoa3.hmRT{slot}'] for r in reply_rows]
+        vals = [v for v in vals if v > 0.0]
+        if not vals:
+            print(f'{remote:>4} {slot:>5} |     no reply-time samples')
+            continue
+        med, p90 = percentile(vals, 50), percentile(vals, 90)
+        p99, mx = percentile(vals, 99), max(vals)
+        stats[remote] = (med, p90, p99, mx)
+        print(f'{remote:>4} {slot:>5} | {med:>8.2f} {p90:>8.2f} {p99:>8.2f} {mx:>8.2f}')
+
+    if stats:
+        print()
+        print('  predicted range error at 1 ppm clock error '
+              '(error = c * ppm * t_reply / 2):')
+        for remote, (med, _, p99, _) in stats.items():
+            err_med = 3e8 * 1e-6 * (med * 1e-3) / 2.0
+            err_p99 = 3e8 * 1e-6 * (p99 * 1e-3) / 2.0
+            print(f'    id {remote:>3}: {err_med:6.2f} m at median, '
+                  f'{err_p99:6.2f} m at p99')
+    return stats
+
+
+def correlate(dist_rows, reply_rows, reply_stats):
+    """Test whether long replies actually coincide with bad distances.
+
+    Splits each remote's samples into a low-reply-time group and a high-reply-time
+    group (below median vs above p90) and compares the distance spread in each.
+    If the reply-time hypothesis holds, the high group should be markedly noisier.
+
+    Caveat: distances and reply times arrive in separate log blocks, so they are
+    only approximately aligned (both are logged at 100 ms). This is good enough
+    to expose a strong effect, not to measure it precisely.
+    """
+    if not reply_stats:
+        return
+
+    print('\n--- does reply time explain the outliers? ---')
+    print(f'{"id":>4} | {"spread, fast replies":>21} | {"spread, slow replies":>21} | ratio')
+    print('-' * 74)
+
+    verdicts = []
+    for slot, remote in enumerate(IDS):
+        if remote not in reply_stats:
+            continue
+        n = min(len(dist_rows), len(reply_rows))
+        pairs = [(reply_rows[i][f'tdoa3.hmRT{slot}'],
+                  dist_rows[i][f'tdoa3.hmD{slot}'])
+                 for i in range(n)
+                 if dist_rows[i][f'tdoa3.hmD{slot}'] != 0.0
+                 and reply_rows[i][f'tdoa3.hmRT{slot}'] > 0.0]
+        if len(pairs) < 20:
+            continue
+
+        med = reply_stats[remote][0]
+        p90 = reply_stats[remote][1]
+        fast = [d for rt, d in pairs if rt <= med]
+        slow = [d for rt, d in pairs if rt >= p90]
+        if len(fast) < 5 or len(slow) < 5:
+            continue
+
+        sd_fast = statistics.pstdev(fast)
+        sd_slow = statistics.pstdev(slow)
+        ratio = (sd_slow / sd_fast) if sd_fast > 1e-9 else float('inf')
+        verdicts.append((remote, ratio))
+        print(f'{remote:>4} | {sd_fast:>18.4f} m | {sd_slow:>18.4f} m | {ratio:>5.1f}x')
+
+    if verdicts:
+        worst = max(r for _, r in verdicts)
+        print()
+        if worst > 3.0:
+            print('  CONFIRMED: slow replies are markedly noisier. The reply-time gate')
+            print('  (tdoa3.hmMaxReply) should remove most outliers. Suggested starting')
+            print('  point: set it just above the median reply time of your ANCHOR links.')
+        else:
+            print('  NOT CONFIRMED: noise does not track reply time. The outliers are')
+            print('  likely multipath or NLOS instead, so rely on the median filter')
+            print('  (tdoa3.hmOutTh) rather than the reply-time gate.')
 
 
 def report(dist_rows, rate_rows):
@@ -164,7 +276,15 @@ def report(dist_rows, rate_rows):
         tx = statistics.mean(r['tdoa3.hmTx'] for r in rate_rows)
         seq = statistics.mean(r['tdoa3.hmSeqOk'] for r in rate_rows)
         est = statistics.mean(r['tdoa3.hmEst'] for r in rate_rows)
+        rej_r = statistics.mean(r['tdoa3.hmRejR'] for r in rate_rows)
+        rej_o = statistics.mean(r['tdoa3.hmRejO'] for r in rate_rows)
+        cc = statistics.mean(abs(r['tdoa3.hmCcPpm']) for r in rate_rows)
         print(f'\nrates [Hz]:  hmTx {tx:.1f}   hmSeqOk {seq:.1f}   hmEst {est:.1f}')
+        print(f'rejected  :  reply-time {rej_r:.1f}/s   outlier {rej_o:.1f}/s')
+        print(f'clock corr:  |{cc:.3f}| ppm mean deviation')
+        if rej_r == 0.0 and rej_o == 0.0:
+            print('  (both rejection thresholds are 0 = disabled; '
+                  'set tdoa3.hmMaxReply / tdoa3.hmOutTh to enable)')
     else:
         tx = seq = est = 0.0
 
@@ -214,10 +334,13 @@ def main():
 
         apply_config(scf)
         time.sleep(1.0)
-        dist_rows, rate_rows = collect(scf, DURATION_S)
+        dist_rows, reply_rows, rate_rows = collect(scf, DURATION_S)
         if not dist_rows:
             raise SystemExit('no log data received -- is the firmware built with hybrid mode?')
         report(dist_rows, rate_rows)
+        print()
+        reply_stats = reply_report(reply_rows)
+        correlate(dist_rows, reply_rows, reply_stats)
 
         print('\nNOTE: hmTwr is left ENABLED. All tdoa3 params are volatile;')
         print('      rerun this script after every reboot.')
