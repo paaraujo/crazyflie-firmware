@@ -529,6 +529,21 @@ static void ageOutLoggedDistances(const uint32_t now_ms) {
   }
 }
 
+// The public header declares the slot count independently; keep them in step.
+_Static_assert(HM_LOG_SLOTS == HYBRID_RANGE_SLOTS,
+               "HYBRID_RANGE_SLOTS in lpsTdoa3Tag.h must match HM_LOG_SLOTS");
+
+bool hybridGetRange(const uint8_t slot, uint8_t* remoteId, float* distance, uint32_t* updated_ms) {
+  if (slot >= HM_LOG_SLOTS) {
+    return false;
+  }
+
+  *remoteId = ctx.logDistIds[slot];
+  *distance = ctx.logDistances[slot];
+  *updated_ms = ctx.logDistUpdated_ms[slot];
+  return true;
+}
+
 static int countSeenAnchorsAndClearCounters() {
   int anchorsCount = 0;
 

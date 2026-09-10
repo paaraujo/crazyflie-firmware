@@ -1,121 +1,114 @@
 /**
- * Swarm encirclement -- onboard radius and phase.
+ * Swarm encirclement -- radius and phase derived from the state estimate.
  *
- * Computes the ego agent's position on the encirclement curve from the state
- * estimate and publishes it as log variables.
+ * ROLE: this is an INDEPENDENT CROSS-CHECK, not the primary phase source.
  *
- * Why these are COMPUTED and not ESTIMATED
- * ----------------------------------------
- * Three non-collinear anchors make 3D position directly observable, so radius
- * and phase are a reduced description of the position the EKF already provides:
+ * The recommended estimator constrains the state to the curve and fuses the UWB
+ * ranges directly, so it never consults the EKF position. That is the right
+ * architecture -- collapsing three degrees of freedom to one is far better
+ * conditioned than trilaterating from three marginal ranges -- but it also
+ * leaves nothing independently checking the filter's phase. This module supplies
+ * that second opinion, from a completely different measurement path (EKF
+ * position, driven by the IMU and the anchor ranges).
  *
- *     r     = || p_xy - c_xy ||         distance from the orbit axis
- *     theta = atan2(y - cy, x - cx)     phase, CCW from +x
+ * Disagreement between swarmPhase.th here and the filter's phase is the signal that
+ * the filter has locked onto the wrong branch of the chord ambiguity, or has
+ * diverged.
  *
- * Carrying them as filter states alongside x, y, z would use five numbers for
- * three degrees of freedom. Beyond being redundant, constraining the position
- * estimate onto the reference curve makes tracking error partly unobservable to
- * the controller -- the estimator would report "on trajectory" while the agent
- * is not. So the EKF owns position, and this module derives phase from it.
- *
- * theta = atan2() is exact while the embedding is the flat circle (R_e = I). A
- * distorted embedding requires the fixed-point inversion of theory.tex 4.1,
- * which is not implemented here yet.
- *
- * The orbit centre defaults to the origin of the anchor frame, which is where
- * the corner anchor A0 of the L-template sits. Override with the swarm.cx/cy
- * parameters if the template origin is elsewhere.
+ * The phase is exact, not approximate: for the tangential embedding of
+ * swarm_curve.h, atan2(q_y - c_y, q_x - c_x) = theta identically, for any
+ * elevation profile. The radius uses the FULL 3D distance from the encirclement
+ * centre, which equals r on the curve for any embedding -- the horizontal
+ * distance would only be correct for a level circle.
  */
 
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "app.h"
-#include "FreeRTOS.h"
-#include "task.h"
-
 #include "log.h"
 #include "param.h"
 
-#define DEBUG_MODULE "SWARMPHASE"
-#include "debug.h"
-
-#define UPDATE_PERIOD_MS 20   // 50 Hz, matched to the ranging rate
+#include "swarm_curve.h"
+#include "swarm_phase.h"
 
 static struct {
-  // Orbit centre in the anchor frame. A0 of the L-template is at the origin,
-  // so these default to zero.
-  float cx;
-  float cy;
-
-  // Nominal orbit height above the anchor plane. Only reported as an error
-  // here; keeping the agents clear of the anchor plane matters because the
-  // vertical direction is ill-conditioned there.
-  float hc;
-
-  // Outputs
-  float r;         // distance from the orbit axis [m]
+  float r;         // distance from the encirclement centre [m]
   float theta;     // phase, CCW from +x [rad]
   float thetaDeg;  // same, in degrees, for convenience when reading logs
-  float zErr;      // height error relative to hc [m]
-  uint8_t valid;   // 1 when the state estimate is usable
-} ctx = {
-  .cx = 0.0f,
-  .cy = 0.0f,
-  .hc = 0.5f,
-};
+  float zErr;      // height error relative to the curve at this phase [m]
+  float bDeg;      // elevation of the curve at this phase [deg]
+  uint8_t valid;   // 1 when the phase is defined
+} ctx;
 
-void appMain(void) {
-  DEBUG_PRINT("Swarm encirclement: onboard phase\n");
+static logVarId_t idX, idY, idZ;
 
-  logVarId_t idX = logGetVarId("stateEstimate", "x");
-  logVarId_t idY = logGetVarId("stateEstimate", "y");
-  logVarId_t idZ = logGetVarId("stateEstimate", "z");
+bool swarmPhaseInit(void) {
+  idX = logGetVarId("stateEstimate", "x");
+  idY = logGetVarId("stateEstimate", "y");
+  idZ = logGetVarId("stateEstimate", "z");
 
-  if (!logVarIdIsValid(idX) || !logVarIdIsValid(idY) || !logVarIdIsValid(idZ)) {
-    DEBUG_PRINT("ERROR: stateEstimate x/y/z not found, phase disabled\n");
+  const bool ok = logVarIdIsValid(idX) && logVarIdIsValid(idY) && logVarIdIsValid(idZ);
+  if (!ok) {
     ctx.valid = 0;
-    while (true) {
-      vTaskDelay(M2T(1000));
-    }
   }
+  return ok;
+}
 
-  TickType_t lastWake = xTaskGetTickCount();
+void swarmPhaseUpdate(const swarmCurve_t* curve) {
+  const float p[3] = {
+    logGetFloat(idX),
+    logGetFloat(idY),
+    logGetFloat(idZ),
+  };
 
-  while (true) {
-    vTaskDelayUntil(&lastWake, M2T(UPDATE_PERIOD_MS));
+  // Distance from the encirclement centre. Equals r exactly when the agent is
+  // on the curve, whatever the elevation profile, because a rotation preserves
+  // length. The horizontal distance would only be correct for a level circle.
+  ctx.r = swarmCurveRadius(curve, p);
 
-    const float x = logGetFloat(idX);
-    const float y = logGetFloat(idY);
-    const float z = logGetFloat(idZ);
+  const float dx = p[0] - curve->cx;
+  const float dy = p[1] - curve->cy;
+  const float horiz = sqrtf(dx * dx + dy * dy);
 
-    const float dx = x - ctx.cx;
-    const float dy = y - ctx.cy;
+  // atan2 is undefined on the orbit axis; hold the previous phase there. The
+  // guard is on the HORIZONTAL distance, since that is what atan2 consumes --
+  // an agent directly above the centre has a large 3D radius but no azimuth.
+  if (horiz > 0.01f) {
+    ctx.theta = swarmCurveTheta(curve, p);
+    ctx.thetaDeg = ctx.theta * 180.0f / (float)M_PI;
 
-    ctx.r = sqrtf(dx * dx + dy * dy);
-    ctx.zErr = z - ctx.hc;
+    // Height error against the curve's OWN height at this phase, which varies
+    // with the elevation profile. A constant reference would be wrong.
+    float b;
+    swarmCurveEvalB(curve, ctx.theta, &b, NULL);
+    ctx.bDeg = b * 180.0f / (float)M_PI;
+    ctx.zErr = p[2] - (curve->cz - ctx.r * sinf(b));
 
-    // atan2f is undefined at the origin; hold the previous phase there rather
-    // than emitting a meaningless value. This happens if the estimate collapses
-    // to the orbit axis, where the phase genuinely is not defined.
-    if (ctx.r > 0.01f) {
-      ctx.theta = atan2f(dy, dx);
-      ctx.thetaDeg = ctx.theta * 180.0f / (float)M_PI;
-      ctx.valid = 1;
-    } else {
-      ctx.valid = 0;
-    }
+    ctx.valid = 1;
+  } else {
+    ctx.valid = 0;
   }
 }
 
-/**
- * Onboard encirclement state, derived from the state estimate.
- */
-LOG_GROUP_START(swarm)
+bool swarmPhaseGet(float* theta, float* r) {
+  if (!ctx.valid) {
+    return false;
+  }
+  if (theta) { *theta = ctx.theta; }
+  if (r)     { *r = ctx.r; }
+  return true;
+}
 
 /**
- * @brief Distance from the orbit axis [m]
+ * Encirclement state derived from the state estimate, for cross-checking the
+ * range-driven filter.
+ */
+LOG_GROUP_START(swarmPhase)
+
+/**
+ * @brief Distance from the encirclement centre [m]. Equals the curve radius
+ * when the agent is on the curve.
  */
 LOG_ADD(LOG_FLOAT, r, &ctx.r)
 
@@ -130,7 +123,13 @@ LOG_ADD(LOG_FLOAT, th, &ctx.theta)
 LOG_ADD(LOG_FLOAT, thDeg, &ctx.thetaDeg)
 
 /**
- * @brief Height error relative to the nominal orbit height swarm.hc [m]
+ * @brief Elevation of the curve at the current phase [deg]. Positive is below
+ * the encirclement centre.
+ */
+LOG_ADD(LOG_FLOAT, bDeg, &ctx.bDeg)
+
+/**
+ * @brief Height error against the curve at the current phase [m]
  */
 LOG_ADD(LOG_FLOAT, zErr, &ctx.zErr)
 
@@ -139,23 +138,4 @@ LOG_ADD(LOG_FLOAT, zErr, &ctx.zErr)
  */
 LOG_ADD(LOG_UINT8, valid, &ctx.valid)
 
-LOG_GROUP_STOP(swarm)
-
-PARAM_GROUP_START(swarm)
-
-/**
- * @brief X coordinate of the orbit centre in the anchor frame [m]
- */
-PARAM_ADD(PARAM_FLOAT, cx, &ctx.cx)
-
-/**
- * @brief Y coordinate of the orbit centre in the anchor frame [m]
- */
-PARAM_ADD(PARAM_FLOAT, cy, &ctx.cy)
-
-/**
- * @brief Nominal orbit height above the anchor plane [m]
- */
-PARAM_ADD(PARAM_FLOAT, hc, &ctx.hc)
-
-PARAM_GROUP_STOP(swarm)
+LOG_GROUP_STOP(swarmPhase)
