@@ -340,7 +340,11 @@ def summarise(samples, label):
     # sd of a split-half difference of means, with n_eff/2 per half.
     expect = 2.0 * std / np.sqrt(neff)
     zscore = np.abs(drift) / np.maximum(expect, 1e-12)
-    drifting = np.any(zscore > 3.0)
+    # Statistical significance is meaningless below physical relevance. Vicon
+    # sits at its quantisation floor (std ~0.0 mm), so a 0.0 mm drift divided by
+    # a ~0 expectation reads as tens of sigma. Require a real effect size too.
+    DRIFT_FLOOR_M = 1.0e-3
+    drifting = bool(np.any((zscore > 3.0) & (np.abs(drift) > DRIFT_FLOOR_M)))
 
     print(f'  {label}')
     print(f'      samples {len(t)}  over {span:.1f} s   ({rate:.1f} Hz)')
