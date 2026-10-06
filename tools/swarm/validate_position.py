@@ -416,6 +416,50 @@ def kabsch(P, Q):
 # per-anchor range residuals
 # --------------------------------------------------------------------------
 
+# Single-sided TWR rescales the reply interval by an estimated clock
+# correction, so a clock error eps leaks straight into range:
+#
+#     range error = c * eps * t_reply / 2
+#
+# With t_reply in ms and the error in metres that inverts to
+#
+#     eps [ppm] = 2e9 / c * bias / t_reply = 6.6713 * bias_m / t_ms
+#
+# Classic TWR (lpsTwrTag.c) uses the double-sided estimator, where the reply
+# intervals cancel algebraically and no clock correction appears at all. That
+# is why the same hardware and geometry range accurately in TWR mode.
+EPS_PPM_PER_M_PER_MS = 2.0e9 / 299792458.0
+
+
+def fit_reply_bias(t_ms, bias_m):
+    """Fit  bias = a + k*t_reply  over the anchors of one drone.
+
+    The intercept absorbs whatever is COMMON to every link -- the Vicon/template
+    frame datum and the antenna-delay calibration, which are not separable from
+    each other but are separable from a reply-time effect. The slope is the
+    reply-time term, and eps = k scaled into ppm.
+
+    Returns (a, eps_ppm, residual_rms, dof) or None if underdetermined.
+    """
+    t = np.asarray(t_ms, float)
+    b = np.asarray(bias_m, float)
+    n = len(t)
+    # The slope needs a lever arm. If every link replies at nearly the same
+    # time there is no way to separate slope from intercept, and the fit will
+    # happily return an enormous eps driven entirely by measurement noise.
+    MIN_SPREAD_MS = 1.0
+    if n < 3 or not np.all(np.isfinite(t)):
+        return None
+    if float(np.ptp(t)) < MIN_SPREAD_MS:
+        return 'flat', float(np.ptp(t))
+    A = np.column_stack([np.ones(n), t])
+    (a, k), *_ = np.linalg.lstsq(A, b, rcond=None)
+    resid = b - (a + k * t)
+    dof = n - 2
+    rms = float(np.sqrt((resid ** 2).sum() / dof)) if dof > 0 else 0.0
+    return float(a), float(k * EPS_PPM_PER_M_PER_MS), rms, dof
+
+
 SUFFIXES = ('_gt', '_vicon', '_mocap', '_truth')
 
 
@@ -486,6 +530,17 @@ def cmd_ranges(args):
             except ValueError:
                 sys.exit(f'ERROR: --anchors entry {i} is not numeric: "{triple}"')
         src = 'command line'
+        print('  *** CAVEAT: these are the CONFIGURED coordinates, in the')
+        print('  *** template frame, while the drone positions come from Vicon.')
+        print('  *** A range is only frame-independent when BOTH ends share a')
+        print('  *** frame, so any Vicon<->template offset (the anchor-plane z')
+        print('  *** datum especially) lands in every "bias" below as a common')
+        print('  *** shift. Read the SPREAD across anchors, not the mean:')
+        print('  ***   tight spread  -> no per-link problem; the mean is frame')
+        print('  ***                    offset and/or antenna delay, mixed')
+        print('  ***   wide spread   -> per-link multipath, and this IS reliable')
+        print('  *** Put markers on the anchors to get trustworthy absolutes.')
+        print()
     else:
         for i, want in enumerate(args.anchor_subjects):
             subj = match_subject(gt, want)
@@ -523,8 +578,10 @@ def cmd_ranges(args):
 
         print(f'  {r}   Vicon position {p_true[0]:+.3f} {p_true[1]:+.3f} '
               f'{p_true[2]:+.3f}')
+        biases, treplies = [], []
+        hdr_rt = f'{"t_reply":>9} {"eps ppm":>9}' if args.with_reply else '   verdict'
         print(f'      {"slot":>5} {"n":>6} {"true":>8} {"meas":>8} '
-              f'{"bias":>9} {"noise":>8}   verdict')
+              f'{"bias":>9} {"noise":>8}{hdr_rt}')
         print('      ' + '-' * 62)
         for slot in sorted(anchors):
             col = a[:, 1 + slot]
@@ -541,8 +598,68 @@ def cmd_ranges(args):
                 verdict = 'short -- check anchor coords'
             else:
                 verdict = 'consistent'
+            if args.with_reply:
+                rt = a[:, 4 + slot]
+                rt = rt[rt != 0.0]
+                t_ms = float(rt.mean()) if len(rt) else float('nan')
+                eps = (EPS_PPM_PER_M_PER_MS * bias / t_ms
+                       if t_ms == t_ms and t_ms > 0 else float('nan'))
+                tail = f'{t_ms:>8.2f}ms {eps:>+9.3f}'
+                treplies.append(t_ms)
+            else:
+                tail = f'   {verdict}'
             print(f'      {slot:>5} {len(live):>6} {true:>8.3f} {meas:>8.3f} '
-                  f'{bias*1000:>+8.0f}mm {noise*1000:>7.1f}mm   {verdict}')
+                  f'{bias*1000:>+8.0f}mm {noise*1000:>7.1f}mm{tail}')
+            biases.append(bias)
+
+        if len(biases) >= 2:
+            b = np.array(biases)
+            spread = float(b.std(ddof=1))
+            print('      ' + '-' * 62)
+            print(f'      across anchors:  mean {b.mean()*1000:+.0f} mm   '
+                  f'SPREAD {spread*1000:.0f} mm')
+            if spread < 0.03:
+                print('        tight -> no per-link problem on this drone. The mean is')
+                print('        a COMMON offset: antenna delay and/or frame datum.')
+            else:
+                print('        WIDE -> PER-LINK error. Either multipath, or the')
+                print('        reply-time effect below. Frame-independent either way.')
+
+            if args.with_reply and len(treplies) == len(biases):
+                fit = fit_reply_bias(treplies, biases)
+                if fit is None:
+                    print()
+                    print('        reply-time fit: need 3+ links with finite reply times.')
+                elif isinstance(fit, tuple) and fit[0] == 'flat':
+                    print()
+                    print(f'        reply times agree to {fit[1]*1000:.0f} us across '
+                          'anchors, so the')
+                    print('        slope cannot be separated from the intercept. But that')
+                    print('        is itself informative: equal reply times means equal')
+                    print('        reply-time bias, so a per-link spread here is NOT a')
+                    print('        clock effect. It is multipath.')
+                else:
+                    a_off, eps_ppm, rms, dof = fit
+                    print()
+                    print('        --- fit  bias = a + k * t_reply ---')
+                    print(f'          a   (common offset) {a_off*1000:>+8.0f} mm'
+                          '   <- frame datum + antenna delay')
+                    print(f'          eps (from slope)    {eps_ppm:>+8.3f} ppm'
+                          '   <- clock-correction error')
+                    print(f'          residual rms        {rms*1000:>8.0f} mm'
+                          f'   over {dof} dof')
+                    explained = 1.0 - (rms / spread) if spread > 0 else 0.0
+                    if abs(eps_ppm) > 5.0:
+                        print('          IMPLAUSIBLE eps (>5 ppm). The bias is probably')
+                        print('          not reply-time driven -- look at multipath.')
+                    elif rms < 0.3 * spread:
+                        print(f'          CONFIRMED: the reply-time model explains '
+                              f'{explained*100:.0f}% of the')
+                        print('          per-link spread. Single-sided TWR is the cause.')
+                        print('          Double-sided TWR would remove it entirely.')
+                    else:
+                        print('          NOT explained by reply time: the residual is as')
+                        print('          large as the spread. Suspect multipath instead.')
         print()
 
     print('=== how to read this ===')
@@ -675,6 +792,9 @@ def main():
     g.add_argument('--topic', default='swarm_ranges',
                    help='custom_topics name publishing tdoa3.hmD0..hmD4 '
                         '(default: swarm_ranges)')
+    g.add_argument('--with-reply', action='store_true',
+                   help='the log block carries hmD0..2 THEN hmRT0..2 (6 floats, '
+                        'exactly one block) -- enables the eps regression')
     g.add_argument('--anchor-subjects', nargs='+', default=['A0', 'A1', 'A2'],
                    help='Vicon subject names for the anchors (a _gt-style '
                         'suffix is ignored)')
