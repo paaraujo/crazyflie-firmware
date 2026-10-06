@@ -45,6 +45,7 @@ against a Vicon stream that is already inside it, and it will look excellent.
 import argparse
 import json
 import math
+import re
 import sys
 from collections import defaultdict
 
@@ -430,6 +431,10 @@ def kabsch(P, Q):
 # is why the same hardware and geometry range accurately in TWR mode.
 EPS_PPM_PER_M_PER_MS = 2.0e9 / 299792458.0
 
+# Slot convention, matching swarm_task.c: 0-2 are anchors, 3 is the leader and
+# 4 the follower. Slot 5 is spare.
+N_ANCHOR_SLOTS = 3
+
 
 def fit_reply_bias(t_ms, bias_m):
     """Fit  bias = a + k*t_reply  over the anchors of one drone.
@@ -479,20 +484,51 @@ def match_subject(gt, want):
     return None
 
 
-def cmd_ranges(args):
-    """Compare MEASURED per-slot ranges against ranges computed from Vicon.
+def parse_slots(spec):
+    """Parse a log-block layout like "D0,D1,D2,RT0,RT1,RT2".
 
-    This is the measurement that separates the two possible causes of a
-    distorted position solution:
-
-      residuals ~ 0, position still wrong  -> the ANCHOR COORDINATES are wrong
-      residuals biased per anchor          -> the RANGING is biased, and by how
-                                              much, on which specific link
-
-    NLOS is one-sided: a reflected path is always LONGER than the direct one,
-    never shorter. So a positive mean residual on one anchor is the signature of
-    multipath on that link, and the sign alone tells you more than the size.
+    Returns (dcol, rcol): slot index -> column index in msg.values.
+    Keeping this explicit means the block can be rearranged for whatever
+    question is being asked without the tool guessing from value counts.
     """
+    dcol, rcol = {}, {}
+    for col, tok in enumerate(t.strip().upper() for t in spec.split(',')):
+        m = re.fullmatch(r'(D|RT)(\d)', tok)
+        if not m:
+            sys.exit(f'ERROR: --slots entry "{tok}" is not D<n> or RT<n>.\n'
+                     '       e.g. --slots D0,D1,D2,RT0,RT1,RT2')
+        (rcol if m.group(1) == 'RT' else dcol)[int(m.group(2))] = col
+    if len(dcol) + len(rcol) > 6:
+        print('  NOTE: more than 6 values -- a CRTP log block holds at most 6 '
+              'floats.')
+    return dcol, rcol
+
+
+def live_mean(a, col):
+    """Mean and std of one column, ignoring the 0.0 no-measurement sentinel."""
+    v = a[:, 1 + col]
+    v = v[v != 0.0]
+    if len(v) < 10:
+        return None, None, len(v)
+    return float(v.mean()), float(v.std(ddof=1)), len(v)
+
+
+def cmd_ranges(args):
+    """Compare MEASURED ranges against ranges computed from Vicon.
+
+    Anchor slots (0-2) separate two causes of a distorted position solution:
+      residuals ~ 0 but position wrong -> anchor COORDINATES are wrong
+      residuals biased per anchor      -> that LINK is biased
+
+    Chord slots (3-4) are the ones the swarm filter actually consumes, and they
+    carry a check the anchor ranges cannot: the same physical distance is
+    measured independently from both ends. Reciprocity needs no ground truth
+    and no frame, so a disagreement there is unambiguous evidence of a ranging
+    fault rather than a survey or datum error.
+    """
+    spec = 'D0,D1,D2,RT0,RT1,RT2' if args.with_reply else args.slots
+    dcol, rcol = parse_slots(spec)
+
     uwb, gt, had_vicon, rng = collect(args.robots, args.duration, True,
                                       'Recording ranges (keep the drones STILL)',
                                       args.topic)
@@ -504,174 +540,215 @@ def cmd_ranges(args):
             '  crazyflies.yaml under  all: firmware_logging: custom_topics:\n\n'
             f'      {args.topic}:\n'
             '        frequency: 10\n'
-            '        vars: ["tdoa3.hmD0", "tdoa3.hmD1", "tdoa3.hmD2",\n'
-            '               "tdoa3.hmD3", "tdoa3.hmD4"]\n\n'
+            f'        vars: [{", ".join(chr(34) + "tdoa3.hm" + ("RT" if k == "RT" else "D") + str(i) + chr(34) for k, i in [("D", i) for i in sorted(dcol)] + [("RT", i) for i in sorted(rcol)])}]\n\n'
             '  then restart crazyflie_server. Check it is up with:\n'
-            f'      ros2 topic hz {args.robots[0]}/{args.topic}\n\n'
-            '  (Max 6 floats per log block -- the CRTP payload is 26 bytes.)')
+            f'      ros2 topic hz {args.robots[0]}/{args.topic}')
     if not gt:
         sys.exit('ERROR: no Vicon data. Ranges can only be checked against truth.')
 
-    # --- anchor positions, preferably measured by Vicon --------------------
-    anchors = {}
-    if args.anchors:
-        for i, triple in enumerate(args.anchors):
-            parts = triple.split(',')
-            if len(parts) != 3:
-                sys.exit(
-                    f'ERROR: --anchors entry {i} has {len(parts)} values, not 3: '
-                    f'"{triple}"\n'
-                    '       Each anchor is ONE argument "x,y,z", separated by '
-                    'SPACES:\n'
-                    '           --anchors 0,0,0 0.62,0,0 0,0.65,0\n'
-                    '       not one long comma-separated list.')
-            try:
-                anchors[i] = np.array([float(v) for v in parts])
-            except ValueError:
-                sys.exit(f'ERROR: --anchors entry {i} is not numeric: "{triple}"')
-        src = 'command line'
-        print('  *** CAVEAT: these are the CONFIGURED coordinates, in the')
-        print('  *** template frame, while the drone positions come from Vicon.')
-        print('  *** A range is only frame-independent when BOTH ends share a')
-        print('  *** frame, so any Vicon<->template offset (the anchor-plane z')
-        print('  *** datum especially) lands in every "bias" below as a common')
-        print('  *** shift. Read the SPREAD across anchors, not the mean:')
-        print('  ***   tight spread  -> no per-link problem; the mean is frame')
-        print('  ***                    offset and/or antenna delay, mixed')
-        print('  ***   wide spread   -> per-link multipath, and this IS reliable')
-        print('  *** Put markers on the anchors to get trustworthy absolutes.')
+    arr = {r: np.array(v, dtype=float) for r, v in rng.items() if v}
+
+    # ---------------- anchors ----------------------------------------------
+    anchor_slots = sorted(i for i in dcol if i < N_ANCHOR_SLOTS)
+    if anchor_slots:
+        anchors = {}
+        if args.anchors:
+            for i, triple in enumerate(args.anchors):
+                parts = triple.split(',')
+                if len(parts) != 3:
+                    sys.exit(
+                        f'ERROR: --anchors entry {i} has {len(parts)} values, '
+                        f'not 3: "{triple}"\n'
+                        '       Each anchor is ONE argument "x,y,z", separated '
+                        'by SPACES:\n'
+                        '           --anchors 0,0,0 0.62,0,0 0,0.65,0')
+                try:
+                    anchors[i] = np.array([float(v) for v in parts])
+                except ValueError:
+                    sys.exit(f'ERROR: --anchors entry {i} is not numeric')
+            print('  *** CAVEAT: these are the CONFIGURED coordinates, in the')
+            print('  *** template frame, while the drone positions come from')
+            print('  *** Vicon. A range is frame-independent only when BOTH ends')
+            print('  *** share a frame, so any Vicon<->template offset lands in')
+            print('  *** every anchor "bias" below. Read the SPREAD, not the mean.')
+            print('  *** The CHORD section further down is immune to this.')
+            print()
+            src = 'command line'
+        else:
+            for i, want in enumerate(args.anchor_subjects):
+                subj = match_subject(gt, want)
+                if subj is None:
+                    sys.exit(f'ERROR: no Vicon subject matches "{want}". Put '
+                             'markers on the anchors, or pass --anchors.')
+                anchors[i] = np.array(gt[subj][-1][1:4])
+            src = 'Vicon'
+
+        print(f'=== anchor positions (from {src}) ===')
+        for i in sorted(anchors):
+            a = anchors[i]
+            print(f'  A{i}  {a[0]:+.4f} {a[1]:+.4f} {a[2]:+.4f}  m')
+        if src == 'Vicon':
+            print('  Baselines measured by Vicon:')
+            for i, j in ((0, 1), (0, 2), (1, 2)):
+                if i in anchors and j in anchors:
+                    print(f'    A{i}-A{j}  '
+                          f'{np.linalg.norm(anchors[i]-anchors[j]):.4f} m')
         print()
-    else:
-        for i, want in enumerate(args.anchor_subjects):
-            subj = match_subject(gt, want)
-            if subj is None:
-                sys.exit(f'ERROR: no Vicon subject matches "{want}". Put markers '
-                         f'on the anchors, or pass --anchors x,y,z x,y,z x,y,z')
-            anchors[i] = np.array(gt[subj][-1][1:4])
-        src = 'Vicon'
 
-    print(f'=== anchor positions (from {src}) ===')
-    for i in sorted(anchors):
-        a = anchors[i]
-        print(f'  A{i}  {a[0]:+.4f} {a[1]:+.4f} {a[2]:+.4f}  m')
-    if src == 'Vicon':
-        print()
-        print('  Baselines, as measured by Vicon:')
-        for i, j in ((0, 1), (0, 2), (1, 2)):
-            if i in anchors and j in anchors:
-                print(f'    A{i}-A{j}  {np.linalg.norm(anchors[i]-anchors[j]):.4f} m')
-        print('  Compare these against what is CONFIGURED in the anchors. A')
-        print('  mismatch here distorts every position by the same proportion.')
-    print()
-
-    print('=== per-anchor range residual:  measured - true ===')
-    print('    (true range computed from Vicon drone and anchor positions)')
-    print()
-    for r in args.robots:
-        samples = rng.get(r, [])
-        subj = match_subject(gt, r)
-        if not samples or subj is None:
-            print(f'  {r}: no data (ranges {len(samples)}, vicon {subj})')
-            continue
-        p_true = np.array(gt[subj][-1][1:4])
-        a = np.array(samples, dtype=float)
-
-        print(f'  {r}   Vicon position {p_true[0]:+.3f} {p_true[1]:+.3f} '
-              f'{p_true[2]:+.3f}')
-        biases, treplies = [], []
-        hdr_rt = f'{"t_reply":>9} {"eps ppm":>9}' if args.with_reply else '   verdict'
-        print(f'      {"slot":>5} {"n":>6} {"true":>8} {"meas":>8} '
-              f'{"bias":>9} {"noise":>8}{hdr_rt}')
-        print('      ' + '-' * 62)
-        for slot in sorted(anchors):
-            col = a[:, 1 + slot]
-            live = col[col != 0.0]           # 0.0 is the no-measurement sentinel
-            if len(live) < 10:
-                print(f'      {slot:>5} {len(live):>6}   -- too few measurements --')
+        print('=== anchor slots: range residual  measured - true ===')
+        for r in args.robots:
+            a = arr.get(r)
+            subj = match_subject(gt, r)
+            if a is None or subj is None:
+                print(f'  {r}: no data (ranges {a is not None}, vicon {subj})')
                 continue
-            true = float(np.linalg.norm(p_true - anchors[slot]))
-            meas, noise = float(live.mean()), float(live.std(ddof=1))
-            bias = meas - true
-            if bias > 3.0 * noise and bias > 0.03:
-                verdict = 'NLOS / multipath'
-            elif bias < -3.0 * noise and bias < -0.03:
-                verdict = 'short -- check anchor coords'
-            else:
-                verdict = 'consistent'
-            if args.with_reply:
-                rt = a[:, 4 + slot]
-                rt = rt[rt != 0.0]
-                t_ms = float(rt.mean()) if len(rt) else float('nan')
-                eps = (EPS_PPM_PER_M_PER_MS * bias / t_ms
-                       if t_ms == t_ms and t_ms > 0 else float('nan'))
-                tail = f'{t_ms:>8.2f}ms {eps:>+9.3f}'
-                treplies.append(t_ms)
-            else:
-                tail = f'   {verdict}'
-            print(f'      {slot:>5} {len(live):>6} {true:>8.3f} {meas:>8.3f} '
-                  f'{bias*1000:>+8.0f}mm {noise*1000:>7.1f}mm{tail}')
-            biases.append(bias)
+            p_true = np.array(gt[subj][-1][1:4])
+            print(f'  {r}   Vicon {p_true[0]:+.3f} {p_true[1]:+.3f} {p_true[2]:+.3f}')
+            hdr = f'{"t_reply":>9} {"eps ppm":>9}' if rcol else ''
+            print(f'      {"slot":>5} {"n":>6} {"true":>8} {"meas":>8} '
+                  f'{"bias":>9} {"noise":>8}{hdr}')
+            print('      ' + '-' * (62 if rcol else 50))
+            biases, treplies = [], []
+            for slot in anchor_slots:
+                if slot not in anchors:
+                    continue
+                meas, noise, n = live_mean(a, dcol[slot])
+                if meas is None:
+                    print(f'      {slot:>5} {n:>6}   -- too few measurements --')
+                    continue
+                true = float(np.linalg.norm(p_true - anchors[slot]))
+                bias = meas - true
+                biases.append(bias)
+                tail = ''
+                if slot in rcol:
+                    t_ms, _, _ = live_mean(a, rcol[slot])
+                    if t_ms:
+                        treplies.append(t_ms)
+                        tail = (f'{t_ms:>8.2f}ms '
+                                f'{EPS_PPM_PER_M_PER_MS*bias/t_ms:>+9.3f}')
+                print(f'      {slot:>5} {n:>6} {true:>8.3f} {meas:>8.3f} '
+                      f'{bias*1000:>+8.0f}mm {noise*1000:>7.1f}mm{tail}')
 
-        if len(biases) >= 2:
-            b = np.array(biases)
-            spread = float(b.std(ddof=1))
-            print('      ' + '-' * 62)
-            print(f'      across anchors:  mean {b.mean()*1000:+.0f} mm   '
-                  f'SPREAD {spread*1000:.0f} mm')
-            if spread < 0.03:
-                print('        tight -> no per-link problem on this drone. The mean is')
-                print('        a COMMON offset: antenna delay and/or frame datum.')
-            else:
-                print('        WIDE -> PER-LINK error. Either multipath, or the')
-                print('        reply-time effect below. Frame-independent either way.')
-
-            if args.with_reply and len(treplies) == len(biases):
-                fit = fit_reply_bias(treplies, biases)
-                if fit is None:
-                    print()
-                    print('        reply-time fit: need 3+ links with finite reply times.')
-                elif isinstance(fit, tuple) and fit[0] == 'flat':
-                    print()
-                    print(f'        reply times agree to {fit[1]*1000:.0f} us across '
-                          'anchors, so the')
-                    print('        slope cannot be separated from the intercept. But that')
-                    print('        is itself informative: equal reply times means equal')
-                    print('        reply-time bias, so a per-link spread here is NOT a')
-                    print('        clock effect. It is multipath.')
+            if len(biases) >= 2:
+                b = np.array(biases)
+                spread = float(b.std(ddof=1))
+                print('      ' + '-' * (62 if rcol else 50))
+                print(f'      across anchors:  mean {b.mean()*1000:+.0f} mm   '
+                      f'SPREAD {spread*1000:.0f} mm')
+                if spread < 0.03:
+                    print('        tight -> no per-link problem. The mean is a COMMON')
+                    print('        offset: antenna delay and/or frame datum.')
                 else:
-                    a_off, eps_ppm, rms, dof = fit
-                    print()
-                    print('        --- fit  bias = a + k * t_reply ---')
-                    print(f'          a   (common offset) {a_off*1000:>+8.0f} mm'
-                          '   <- frame datum + antenna delay')
-                    print(f'          eps (from slope)    {eps_ppm:>+8.3f} ppm'
-                          '   <- clock-correction error')
-                    print(f'          residual rms        {rms*1000:>8.0f} mm'
-                          f'   over {dof} dof')
-                    explained = 1.0 - (rms / spread) if spread > 0 else 0.0
-                    if abs(eps_ppm) > 5.0:
-                        print('          IMPLAUSIBLE eps (>5 ppm). The bias is probably')
-                        print('          not reply-time driven -- look at multipath.')
-                    elif rms < 0.3 * spread:
-                        print(f'          CONFIRMED: the reply-time model explains '
-                              f'{explained*100:.0f}% of the')
-                        print('          per-link spread. Single-sided TWR is the cause.')
-                        print('          Double-sided TWR would remove it entirely.')
-                    else:
-                        print('          NOT explained by reply time: the residual is as')
-                        print('          large as the spread. Suspect multipath instead.')
+                    print('        WIDE -> per-link error.')
+                    if np.all(b > 0.0):
+                        print('        All POSITIVE -> consistent with multipath.')
+                    elif np.any(b < -0.03):
+                        neg = [anchor_slots[i] for i, v in enumerate(b) if v < -0.03]
+                        print(f'        Slot(s) {neg} NEGATIVE: measured SHORTER than')
+                        print('        true. Multipath only ADDS path length, so this is')
+                        print('        not multipath. Suspect the frame datum, the')
+                        print('        configured coordinates, or timestamp pairing.')
+                if len(treplies) == len(biases) and treplies:
+                    fit = fit_reply_bias(treplies, biases)
+                    if isinstance(fit, tuple) and fit[0] == 'flat':
+                        print(f'        reply times agree to {fit[1]*1000:.0f} us -- no')
+                        print('        lever arm, so the per-link spread is NOT a clock')
+                        print('        effect (equal reply, equal reply-time bias).')
+                    elif fit:
+                        a_off, eps, rms, dof = fit
+                        print(f'        fit bias = a + k*t:  a {a_off*1000:+.0f} mm   '
+                              f'eps {eps:+.3f} ppm   rms {rms*1000:.0f} mm ({dof} dof)')
+                        if abs(eps) > 5.0:
+                            print('        IMPLAUSIBLE eps -- not reply-time driven.')
+                        elif rms < 0.3 * spread:
+                            print('        CONFIRMED: single-sided TWR clock error.')
+                        else:
+                            print('        NOT explained by reply time.')
+            print()
+
+    # ---------------- chords ----------------------------------------------
+    chord_slots = sorted(i for i in dcol if i >= N_ANCHOR_SLOTS)
+    if not chord_slots:
+        print('(no chord slots in --slots; add D3,D4 to check the chords)')
+        return
+    if not args.ring:
+        print('=== chord slots ===')
+        print('  --ring is needed to say who is in slot 3 and slot 4.')
+        print('  e.g.  --ring C23 C24 C25   (slot 3 = next, slot 4 = previous)')
+        return
+
+    ring = args.ring
+    peer = {}
+    for i, ego in enumerate(ring):
+        peer[ego] = {3: ring[(i + 1) % len(ring)],
+                     4: ring[(i - 1) % len(ring)]}
+
+    print('=== chord slots: ego -> leader (3) and follower (4) ===')
+    print('    Chords are frame-independent: both ends are Vicon positions, so')
+    print('    no datum or survey error enters. This is the clean measurement.')
+    print()
+    measured = {}
+    for ego in args.robots:
+        a = arr.get(ego)
+        s_ego = match_subject(gt, ego)
+        if a is None or s_ego is None:
+            print(f'  {ego}: no data')
+            continue
+        p_ego = np.array(gt[s_ego][-1][1:4])
+        print(f'  {ego}')
+        print(f'      {"slot":>5} {"peer":>6} {"n":>6} {"true":>8} {"meas":>8} '
+              f'{"bias":>9} {"noise":>8}')
+        print('      ' + '-' * 56)
+        for slot in chord_slots:
+            other = peer.get(ego, {}).get(slot)
+            if other is None:
+                continue
+            s_oth = match_subject(gt, other)
+            if s_oth is None:
+                print(f'      {slot:>5} {other:>6}   no Vicon subject')
+                continue
+            meas, noise, n = live_mean(a, dcol[slot])
+            if meas is None:
+                print(f'      {slot:>5} {other:>6} {n:>6}   -- too few --')
+                continue
+            true = float(np.linalg.norm(p_ego - np.array(gt[s_oth][-1][1:4])))
+            measured[(ego, other)] = (meas, noise, true)
+            print(f'      {slot:>5} {other:>6} {n:>6} {true:>8.3f} {meas:>8.3f} '
+                  f'{(meas-true)*1000:>+8.0f}mm {noise*1000:>7.1f}mm')
         print()
 
-    print('=== how to read this ===')
-    print('  bias ~ 0 on every anchor, but the POSITION is still wrong')
-    print('      -> ranging is fine; the configured anchor coordinates are not.')
-    print('  bias positive on one or two anchors')
-    print('      -> NLOS on those links. A reflected path is always longer, so')
-    print('         a positive bias is multipath and a negative one is not.')
-    print('  noise ~ 20 mm but bias ~ 100 mm')
-    print('      -> PERSISTENT bias. The median outlier filter cannot see this:')
-    print('         the median of consistently-biased samples is the biased value.')
-    print('         Only redundancy (>3 anchors) can reject it.')
+    print('=== reciprocity: the SAME distance, measured from both ends ===')
+    print('    No ground truth and no frame needed. The physical distance is')
+    print('    identical, so any disagreement beyond the noise is a ranging')
+    print('    fault -- and it localises to a specific link.')
+    print()
+    seen = set()
+    print(f'  {"link":>14} {"A->B":>8} {"B->A":>8} {"diff":>9} {"vs noise":>10}')
+    print('  ' + '-' * 54)
+    worst = 0.0
+    for (ego, other) in list(measured):
+        key = tuple(sorted((ego, other)))
+        if key in seen or (other, ego) not in measured:
+            continue
+        seen.add(key)
+        m1, n1, true = measured[(ego, other)]
+        m2, n2, _ = measured[(other, ego)]
+        diff = m1 - m2
+        comb = math.sqrt(n1 * n1 + n2 * n2)
+        worst = max(worst, abs(diff))
+        sig = abs(diff) / comb if comb > 0 else float('inf')
+        mark = '   <-- INCONSISTENT' if sig > 3.0 else ''
+        print(f'  {key[0]+"-"+key[1]:>14} {m1:>8.3f} {m2:>8.3f} '
+              f'{diff*1000:>+8.0f}mm {sig:>9.1f}x{mark}')
+    if not seen:
+        print('  (need both directions of a link -- pass all drones in --robots)')
+    else:
+        print()
+        print(f'  worst disagreement {worst*1000:.0f} mm')
+        print('  A reciprocal pair that agrees but disagrees with Vicon means a')
+        print('  SHARED bias (antenna delay on both units). A pair that disagrees')
+        print('  with ITSELF means one direction is faulty -- which is the one')
+        print('  case no amount of calibration can fix.')
 
 
 def cmd_align(args):
@@ -792,6 +869,14 @@ def main():
     g.add_argument('--topic', default='swarm_ranges',
                    help='custom_topics name publishing tdoa3.hmD0..hmD4 '
                         '(default: swarm_ranges)')
+    g.add_argument('--slots', default='D0,D1,D2,D3,D4',
+                   help='log-block layout, in order. D<n> = tdoa3.hmD<n>, '
+                        'RT<n> = tdoa3.hmRT<n>. Max 6. '
+                        'default: D0,D1,D2,D3,D4')
+    g.add_argument('--ring', nargs='+',
+                   help='formation order for the chord slots, e.g. '
+                        'C23 C24 C25 -- slot 3 is the NEXT drone, slot 4 the '
+                        'PREVIOUS one')
     g.add_argument('--with-reply', action='store_true',
                    help='the log block carries hmD0..2 THEN hmRT0..2 (6 floats, '
                         'exactly one block) -- enables the eps regression')
