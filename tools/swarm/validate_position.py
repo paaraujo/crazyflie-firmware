@@ -55,8 +55,8 @@ import numpy as np
 # recording
 # --------------------------------------------------------------------------
 
-def collect(robots, duration, want_vicon, msg_prefix='Recording'):
-    """Subscribe and gather pose samples. Returns (uwb, gt) dicts of lists."""
+def collect(robots, duration, want_vicon, msg_prefix='Recording', ranges_topic=None):
+    """Subscribe and gather samples. Returns (uwb, gt, had_vicon, rng)."""
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -71,9 +71,17 @@ def collect(robots, duration, want_vicon, msg_prefix='Recording'):
             sys.exit('ERROR: --vicon needs motion_capture_tracking_interfaces.\n'
                      '       Source your ROS workspace, or drop --vicon.')
 
+    ranges_msg = None
+    if ranges_topic:
+        try:
+            from crazyflie_interfaces.msg import LogDataGeneric
+            ranges_msg = LogDataGeneric
+        except ImportError:
+            sys.exit('ERROR: needs crazyflie_interfaces. Source your ROS workspace.')
+
     rclpy.init()
     node = Node('validate_position')
-    uwb, gt = defaultdict(list), defaultdict(list)
+    uwb, gt, rng = defaultdict(list), defaultdict(list), defaultdict(list)
 
     def make_cb(name):
         def cb(msg):
@@ -84,6 +92,16 @@ def collect(robots, duration, want_vicon, msg_prefix='Recording'):
 
     for r in robots:
         node.create_subscription(PoseStamped, f'/{r}/pose', make_cb(r), 10)
+
+    if ranges_msg is not None:
+        def make_rng_cb(name):
+            def cb(msg):
+                t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+                rng[name].append((t,) + tuple(msg.values))
+            return cb
+        for r in robots:
+            node.create_subscription(ranges_msg, f'/{r}/{ranges_topic}',
+                                     make_rng_cb(r), 10)
 
     if vicon_msg is not None:
         sensor_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -106,7 +124,7 @@ def collect(robots, duration, want_vicon, msg_prefix='Recording'):
 
     node.destroy_node()
     rclpy.shutdown()
-    return uwb, gt, vicon_msg is not None
+    return uwb, gt, vicon_msg is not None, rng
 
 
 # --------------------------------------------------------------------------
@@ -238,8 +256,8 @@ def make_plot(t, p, psds, label, path):
 
 
 def cmd_hover(args):
-    uwb, gt, had_vicon = collect(args.robots, args.duration, args.vicon,
-                                 'Hovering -- recording')
+    uwb, gt, had_vicon, _ = collect(args.robots, args.duration, args.vicon,
+                                    'Hovering -- recording')
     if not uwb:
         sys.exit('ERROR: no /pose messages received.')
 
@@ -260,8 +278,8 @@ def cmd_hover(args):
 
 
 def cmd_record(args):
-    uwb, gt, had_vicon = collect(args.robots, args.duration, args.vicon,
-                                 'Recording (keep the drones STILL)')
+    uwb, gt, had_vicon, _ = collect(args.robots, args.duration, args.vicon,
+                                    'Recording (keep the drones STILL)')
 
     if not uwb:
         sys.exit('ERROR: no /pose messages received. Is crazyflie_server running, '
@@ -394,6 +412,133 @@ def kabsch(P, Q):
     return R, qc - R @ pc
 
 
+# --------------------------------------------------------------------------
+# per-anchor range residuals
+# --------------------------------------------------------------------------
+
+SUFFIXES = ('_gt', '_vicon', '_mocap', '_truth')
+
+
+def strip_suffix(name):
+    low = name.lower()
+    for suf in SUFFIXES:
+        if low.endswith(suf):
+            return low[:-len(suf)]
+    return low
+
+
+def match_subject(gt, want):
+    """Find a Vicon subject matching `want`, ignoring a _gt-style suffix."""
+    for subj in gt:
+        if strip_suffix(subj) == want.lower():
+            return subj
+    return None
+
+
+def cmd_ranges(args):
+    """Compare MEASURED per-slot ranges against ranges computed from Vicon.
+
+    This is the measurement that separates the two possible causes of a
+    distorted position solution:
+
+      residuals ~ 0, position still wrong  -> the ANCHOR COORDINATES are wrong
+      residuals biased per anchor          -> the RANGING is biased, and by how
+                                              much, on which specific link
+
+    NLOS is one-sided: a reflected path is always LONGER than the direct one,
+    never shorter. So a positive mean residual on one anchor is the signature of
+    multipath on that link, and the sign alone tells you more than the size.
+    """
+    uwb, gt, had_vicon, rng = collect(args.robots, args.duration, True,
+                                      'Recording ranges (keep the drones STILL)',
+                                      args.topic)
+    if not rng or not any(rng.values()):
+        sys.exit(f'ERROR: no /{{robot}}/{args.topic} messages.\n'
+                 '       Add a custom_topics entry publishing tdoa3.hmD0..hmD4 '
+                 '-- see the docs printed by --help.')
+    if not gt:
+        sys.exit('ERROR: no Vicon data. Ranges can only be checked against truth.')
+
+    # --- anchor positions, preferably measured by Vicon --------------------
+    anchors = {}
+    if args.anchors:
+        for i, triple in enumerate(args.anchors):
+            try:
+                anchors[i] = np.array([float(v) for v in triple.split(',')])
+            except ValueError:
+                sys.exit(f'ERROR: --anchors entry {i} is not "x,y,z": {triple}')
+        src = 'command line'
+    else:
+        for i, want in enumerate(args.anchor_subjects):
+            subj = match_subject(gt, want)
+            if subj is None:
+                sys.exit(f'ERROR: no Vicon subject matches "{want}". Put markers '
+                         f'on the anchors, or pass --anchors x,y,z x,y,z x,y,z')
+            anchors[i] = np.array(gt[subj][-1][1:4])
+        src = 'Vicon'
+
+    print(f'=== anchor positions (from {src}) ===')
+    for i in sorted(anchors):
+        a = anchors[i]
+        print(f'  A{i}  {a[0]:+.4f} {a[1]:+.4f} {a[2]:+.4f}  m')
+    if src == 'Vicon':
+        print()
+        print('  Baselines, as measured by Vicon:')
+        for i, j in ((0, 1), (0, 2), (1, 2)):
+            if i in anchors and j in anchors:
+                print(f'    A{i}-A{j}  {np.linalg.norm(anchors[i]-anchors[j]):.4f} m')
+        print('  Compare these against what is CONFIGURED in the anchors. A')
+        print('  mismatch here distorts every position by the same proportion.')
+    print()
+
+    print('=== per-anchor range residual:  measured - true ===')
+    print('    (true range computed from Vicon drone and anchor positions)')
+    print()
+    for r in args.robots:
+        samples = rng.get(r, [])
+        subj = match_subject(gt, r)
+        if not samples or subj is None:
+            print(f'  {r}: no data (ranges {len(samples)}, vicon {subj})')
+            continue
+        p_true = np.array(gt[subj][-1][1:4])
+        a = np.array(samples, dtype=float)
+
+        print(f'  {r}   Vicon position {p_true[0]:+.3f} {p_true[1]:+.3f} '
+              f'{p_true[2]:+.3f}')
+        print(f'      {"slot":>5} {"n":>6} {"true":>8} {"meas":>8} '
+              f'{"bias":>9} {"noise":>8}   verdict')
+        print('      ' + '-' * 62)
+        for slot in sorted(anchors):
+            col = a[:, 1 + slot]
+            live = col[col != 0.0]           # 0.0 is the no-measurement sentinel
+            if len(live) < 10:
+                print(f'      {slot:>5} {len(live):>6}   -- too few measurements --')
+                continue
+            true = float(np.linalg.norm(p_true - anchors[slot]))
+            meas, noise = float(live.mean()), float(live.std(ddof=1))
+            bias = meas - true
+            if bias > 3.0 * noise and bias > 0.03:
+                verdict = 'NLOS / multipath'
+            elif bias < -3.0 * noise and bias < -0.03:
+                verdict = 'short -- check anchor coords'
+            else:
+                verdict = 'consistent'
+            print(f'      {slot:>5} {len(live):>6} {true:>8.3f} {meas:>8.3f} '
+                  f'{bias*1000:>+8.0f}mm {noise*1000:>7.1f}mm   {verdict}')
+        print()
+
+    print('=== how to read this ===')
+    print('  bias ~ 0 on every anchor, but the POSITION is still wrong')
+    print('      -> ranging is fine; the configured anchor coordinates are not.')
+    print('  bias positive on one or two anchors')
+    print('      -> NLOS on those links. A reflected path is always longer, so')
+    print('         a positive bias is multipath and a negative one is not.')
+    print('  noise ~ 20 mm but bias ~ 100 mm')
+    print('      -> PERSISTENT bias. The median outlier filter cannot see this:')
+    print('         the median of consistently-biased samples is the biased value.')
+    print('         Only redundancy (>3 anchors) can reject it.')
+
+
 def cmd_align(args):
     pairs, labels = [], []
 
@@ -503,6 +648,22 @@ def main():
                    help='also record /poses, to separate real motion from error')
     h.add_argument('--plot', help='path prefix for PNG plots')
     h.set_defaults(func=cmd_hover)
+
+    g = sub.add_parser('ranges',
+                       help='per-anchor range residual vs Vicon (needs markers '
+                            'on the anchors)')
+    g.add_argument('--robots', nargs='+', required=True)
+    g.add_argument('--duration', type=float, default=60.0, help='seconds')
+    g.add_argument('--topic', default='swarm_ranges',
+                   help='custom_topics name publishing tdoa3.hmD0..hmD4 '
+                        '(default: swarm_ranges)')
+    g.add_argument('--anchor-subjects', nargs='+', default=['A0', 'A1', 'A2'],
+                   help='Vicon subject names for the anchors (a _gt-style '
+                        'suffix is ignored)')
+    g.add_argument('--anchors', nargs='+',
+                   help='fallback if the anchors have no markers: positions as '
+                        'x,y,z x,y,z x,y,z in the template frame')
+    g.set_defaults(func=cmd_ranges)
 
     a = sub.add_parser('align', help='fit the frame and report accuracy')
     a.add_argument('files', nargs='+', help='JSON files from record --vicon')
