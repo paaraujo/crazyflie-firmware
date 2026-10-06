@@ -453,9 +453,18 @@ def cmd_ranges(args):
                                       'Recording ranges (keep the drones STILL)',
                                       args.topic)
     if not rng or not any(rng.values()):
-        sys.exit(f'ERROR: no /{{robot}}/{args.topic} messages.\n'
-                 '       Add a custom_topics entry publishing tdoa3.hmD0..hmD4 '
-                 '-- see the docs printed by --help.')
+        want = '  '.join(f'/{r}/{args.topic}' for r in args.robots)
+        sys.exit(
+            f'ERROR: no messages on   {want}\n\n'
+            '  The per-slot ranges are not published by default. Add this to\n'
+            '  crazyflies.yaml under  all: firmware_logging: custom_topics:\n\n'
+            f'      {args.topic}:\n'
+            '        frequency: 10\n'
+            '        vars: ["tdoa3.hmD0", "tdoa3.hmD1", "tdoa3.hmD2",\n'
+            '               "tdoa3.hmD3", "tdoa3.hmD4"]\n\n'
+            '  then restart crazyflie_server. Check it is up with:\n'
+            f'      ros2 topic hz {args.robots[0]}/{args.topic}\n\n'
+            '  (Max 6 floats per log block -- the CRTP payload is 26 bytes.)')
     if not gt:
         sys.exit('ERROR: no Vicon data. Ranges can only be checked against truth.')
 
@@ -463,10 +472,19 @@ def cmd_ranges(args):
     anchors = {}
     if args.anchors:
         for i, triple in enumerate(args.anchors):
+            parts = triple.split(',')
+            if len(parts) != 3:
+                sys.exit(
+                    f'ERROR: --anchors entry {i} has {len(parts)} values, not 3: '
+                    f'"{triple}"\n'
+                    '       Each anchor is ONE argument "x,y,z", separated by '
+                    'SPACES:\n'
+                    '           --anchors 0,0,0 0.62,0,0 0,0.65,0\n'
+                    '       not one long comma-separated list.')
             try:
-                anchors[i] = np.array([float(v) for v in triple.split(',')])
+                anchors[i] = np.array([float(v) for v in parts])
             except ValueError:
-                sys.exit(f'ERROR: --anchors entry {i} is not "x,y,z": {triple}')
+                sys.exit(f'ERROR: --anchors entry {i} is not numeric: "{triple}"')
         src = 'command line'
     else:
         for i, want in enumerate(args.anchor_subjects):
