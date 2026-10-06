@@ -666,6 +666,10 @@ def cmd_ranges(args):
                             print('        NOT explained by reply time.')
             print()
 
+    if not anchor_slots:
+        print('(no anchor slots in --slots; anchor section skipped)')
+        print()
+
     # ---------------- chords ----------------------------------------------
     chord_slots = sorted(i for i in dcol if i >= N_ANCHOR_SLOTS)
     if not chord_slots:
@@ -688,6 +692,7 @@ def cmd_ranges(args):
     print('    no datum or survey error enters. This is the clean measurement.')
     print()
     measured = {}
+    chord_fit = []
     for ego in args.robots:
         a = arr.get(ego)
         s_ego = match_subject(gt, ego)
@@ -696,9 +701,10 @@ def cmd_ranges(args):
             continue
         p_ego = np.array(gt[s_ego][-1][1:4])
         print(f'  {ego}')
+        hdr = f'{"t_reply":>9} {"eps ppm":>9}' if rcol else ''
         print(f'      {"slot":>5} {"peer":>6} {"n":>6} {"true":>8} {"meas":>8} '
-              f'{"bias":>9} {"noise":>8}')
-        print('      ' + '-' * 56)
+              f'{"bias":>9} {"noise":>8}{hdr}')
+        print('      ' + '-' * (68 if rcol else 56))
         for slot in chord_slots:
             other = peer.get(ego, {}).get(slot)
             if other is None:
@@ -712,9 +718,17 @@ def cmd_ranges(args):
                 print(f'      {slot:>5} {other:>6} {n:>6}   -- too few --')
                 continue
             true = float(np.linalg.norm(p_ego - np.array(gt[s_oth][-1][1:4])))
+            bias = meas - true
             measured[(ego, other)] = (meas, noise, true)
+            tail = ''
+            if slot in rcol:
+                t_ms, _, _ = live_mean(a, rcol[slot])
+                if t_ms:
+                    chord_fit.append((t_ms, bias, f'{ego}->{other}'))
+                    tail = (f'{t_ms:>8.2f}ms '
+                            f'{EPS_PPM_PER_M_PER_MS*bias/t_ms:>+9.3f}')
             print(f'      {slot:>5} {other:>6} {n:>6} {true:>8.3f} {meas:>8.3f} '
-                  f'{(meas-true)*1000:>+8.0f}mm {noise*1000:>7.1f}mm')
+                  f'{bias*1000:>+8.0f}mm {noise*1000:>7.1f}mm{tail}')
         print()
 
     print('=== reciprocity: the SAME distance, measured from both ends ===')
@@ -746,9 +760,50 @@ def cmd_ranges(args):
         print()
         print(f'  worst disagreement {worst*1000:.0f} mm')
         print('  A reciprocal pair that agrees but disagrees with Vicon means a')
-        print('  SHARED bias (antenna delay on both units). A pair that disagrees')
-        print('  with ITSELF means one direction is faulty -- which is the one')
-        print('  case no amount of calibration can fix.')
+        print('  SHARED bias. A pair that disagrees with ITSELF means one')
+        print('  direction is faulty -- the one case calibration cannot fix.')
+
+    if len(chord_fit) >= 3:
+        # Pooled across every chord observation. Each drone has only two chord
+        # links, too few for a 2-parameter fit on its own, so this assumes the
+        # units have similar clock-correction error and asks whether the bias
+        # scales with the reply interval at all.
+        t = np.array([c[0] for c in chord_fit])
+        b = np.array([c[1] for c in chord_fit])
+        print()
+        print('=== does the chord bias scale with the reply interval? ===')
+        print('    Single-sided TWR rescales the reply by an estimated clock')
+        print('    correction, so an error eps gives  bias = c*eps*t_reply/2.')
+        print('    Crazyflies reply on a contended schedule, so t_reply varies')
+        print('    here in a way the anchors\' steady schedule did not.')
+        print()
+        print(f'  reply-time range {t.min():.2f} - {t.max():.2f} ms  '
+              f'(spread {np.ptp(t)*1000:.0f} us)')
+        fit = fit_reply_bias(t, b)
+        if isinstance(fit, tuple) and fit[0] == 'flat':
+            print('  Reply times are effectively equal, so there is still no lever')
+            print('  arm. The common bias CANNOT be attributed to the clock from')
+            print('  this data -- it is consistent with it, but equally with any')
+            print('  other constant offset. A different experiment is needed:')
+            print('  vary the anchor TX rate, or compare against classic TWR.')
+        elif fit:
+            a_off, eps, rms, dof = fit
+            spread = float(b.std(ddof=1))
+            print(f'  fit  bias = a + k*t_reply   over {len(t)} observations')
+            print(f'    a   (reply-independent) {a_off*1000:>+8.0f} mm')
+            print(f'    eps (from slope)        {eps:>+8.3f} ppm')
+            print(f'    residual rms            {rms*1000:>8.0f} mm  ({dof} dof)')
+            print(f'    bias spread before fit  {spread*1000:>8.0f} mm')
+            if abs(eps) > 5.0:
+                print('    IMPLAUSIBLE eps -- not reply-time driven.')
+            elif rms < 0.5 * spread:
+                print('    CONFIRMED: the bias scales with reply time. Single-sided')
+                print('    TWR clock error. Double-sided TWR would remove it.')
+            else:
+                print('    NOT explained by reply time: the residual is as large as')
+                print('    the spread. The offset is reply-INDEPENDENT, so look at')
+                print('    the intercept instead -- a constant in the range')
+                print('    computation, not a clock effect.')
 
 
 def cmd_align(args):
