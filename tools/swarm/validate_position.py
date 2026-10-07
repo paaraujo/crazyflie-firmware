@@ -513,6 +513,61 @@ def live_mean(a, col):
     return float(v.mean()), float(v.std(ddof=1)), len(v)
 
 
+def solve_pos(anchors, ranges, p0, iters=60):
+    """Gauss-Newton position solve from ranges. `anchors`/`ranges` keyed by slot.
+
+    Started from p0, which also resolves the mirror branch that three ranges
+    would otherwise leave open.
+    """
+    ids = [i for i in anchors if i in ranges]
+    if len(ids) < 3:
+        return None
+    p = np.array(p0, float)
+    for _ in range(iters):
+        r, J = [], []
+        for i in ids:
+            v = p - anchors[i]
+            d = np.linalg.norm(v)
+            if d < 1e-9:
+                d, v = 1e-9, np.array([1e-9, 0.0, 0.0])
+            r.append(ranges[i] - d)
+            J.append(v / d)
+        step, *_ = np.linalg.lstsq(np.array(J), np.array(r), rcond=None)
+        p = p + step
+        if np.abs(step).max() < 1e-10:
+            break
+    return p
+
+
+def leave_one_out(anchors, ranges, p0):
+    """For each anchor: solve from the OTHERS, then predict this one.
+
+    This is the check that redundancy buys and ground truth is not needed for.
+    Holding one measurement out keeps its own error from being absorbed into
+    the position solution, so an inconsistent link stands out instead of being
+    smeared across every residual.
+    """
+    out = {}
+    ids = [i for i in anchors if i in ranges]
+    for held in ids:
+        sub_a = {i: anchors[i] for i in ids if i != held}
+        sub_r = {i: ranges[i] for i in ids if i != held}
+        if len(sub_a) < 3:
+            continue
+        p = solve_pos(sub_a, sub_r, p0)
+        if p is None:
+            continue
+        pred = float(np.linalg.norm(p - anchors[held]))
+        # How well do the REMAINING anchors agree among themselves? If holding
+        # one out leaves a mutually consistent set, that one is the culprit --
+        # excluding any innocent anchor leaves the fault behind and the subset
+        # fits badly. This is what separates the bad link from its victims.
+        inner = [sub_r[i] - np.linalg.norm(p - sub_a[i]) for i in sub_a]
+        inner_rms = float(np.sqrt(np.mean(np.square(inner))))
+        out[held] = (pred, ranges[held] - pred, inner_rms)
+    return out
+
+
 def cmd_ranges(args):
     """Compare MEASURED ranges against ranges computed from Vicon.
 
@@ -543,13 +598,21 @@ def cmd_ranges(args):
             f'        vars: [{", ".join(chr(34) + "tdoa3.hm" + ("RT" if k == "RT" else "D") + str(i) + chr(34) for k, i in [("D", i) for i in sorted(dcol)] + [("RT", i) for i in sorted(rcol)])}]\n\n'
             '  then restart crazyflie_server. Check it is up with:\n'
             f'      ros2 topic hz {args.robots[0]}/{args.topic}')
-    if not gt:
-        sys.exit('ERROR: no Vicon data. Ranges can only be checked against truth.')
+    have_truth = bool(gt)
+    if not have_truth:
+        print('No Vicon. Reporting NOISE and SELF-CONSISTENCY, which need no')
+        print('ground truth. Absolute bias cannot be measured without it.')
+        print()
 
     arr = {r: np.array(v, dtype=float) for r, v in rng.items() if v}
 
     # ---------------- anchors ----------------------------------------------
-    anchor_slots = sorted(i for i in dcol if i < N_ANCHOR_SLOTS)
+    try:
+        role_anchor = {int(x) for x in args.anchor_slots.split(',') if x.strip()}
+    except ValueError:
+        sys.exit('ERROR: --anchor-slots must be comma-separated slot numbers, '
+                 'e.g. 0,1,2,3,4')
+    anchor_slots = sorted(i for i in dcol if i in role_anchor)
     if anchor_slots:
         anchors = {}
         if args.anchors:
@@ -566,13 +629,14 @@ def cmd_ranges(args):
                     anchors[i] = np.array([float(v) for v in parts])
                 except ValueError:
                     sys.exit(f'ERROR: --anchors entry {i} is not numeric')
-            print('  *** CAVEAT: these are the CONFIGURED coordinates, in the')
-            print('  *** template frame, while the drone positions come from')
-            print('  *** Vicon. A range is frame-independent only when BOTH ends')
-            print('  *** share a frame, so any Vicon<->template offset lands in')
-            print('  *** every anchor "bias" below. Read the SPREAD, not the mean.')
-            print('  *** The CHORD section further down is immune to this.')
-            print()
+            if have_truth:
+                print('  *** CAVEAT: these are CONFIGURED coordinates in the template')
+                print('  *** frame, while the drone positions come from Vicon. A range')
+                print('  *** is frame-independent only when BOTH ends share a frame, so')
+                print('  *** any datum offset lands in every "bias" below. Read the')
+                print('  *** SPREAD, not the mean. Chords and the self-consistency')
+                print('  *** check further down are immune to this.')
+                print()
             src = 'command line'
         else:
             for i, want in enumerate(args.anchor_subjects):
@@ -598,23 +662,33 @@ def cmd_ranges(args):
         print('=== anchor slots: range residual  measured - true ===')
         for r in args.robots:
             a = arr.get(r)
-            subj = match_subject(gt, r)
-            if a is None or subj is None:
-                print(f'  {r}: no data (ranges {a is not None}, vicon {subj})')
+            subj = match_subject(gt, r) if have_truth else None
+            if a is None:
+                print(f'  {r}: no range data')
                 continue
-            p_true = np.array(gt[subj][-1][1:4])
-            print(f'  {r}   Vicon {p_true[0]:+.3f} {p_true[1]:+.3f} {p_true[2]:+.3f}')
+            p_true = np.array(gt[subj][-1][1:4]) if subj else None
+            if p_true is not None:
+                print(f'  {r}   Vicon {p_true[0]:+.3f} {p_true[1]:+.3f} '
+                      f'{p_true[2]:+.3f}')
+            else:
+                print(f'  {r}')
             hdr = f'{"t_reply":>9} {"eps ppm":>9}' if rcol else ''
             print(f'      {"slot":>5} {"n":>6} {"true":>8} {"meas":>8} '
                   f'{"bias":>9} {"noise":>8}{hdr}')
             print('      ' + '-' * (62 if rcol else 50))
             biases, treplies = [], []
+            live = {}
             for slot in anchor_slots:
                 if slot not in anchors:
                     continue
                 meas, noise, n = live_mean(a, dcol[slot])
                 if meas is None:
                     print(f'      {slot:>5} {n:>6}   -- too few measurements --')
+                    continue
+                live[slot] = (meas, noise)
+                if p_true is None:
+                    print(f'      {slot:>5} {n:>6} {"--":>8} {meas:>8.3f} '
+                          f'{"--":>9} {noise*1000:>7.1f}mm')
                     continue
                 true = float(np.linalg.norm(p_true - anchors[slot]))
                 bias = meas - true
@@ -664,6 +738,54 @@ def cmd_ranges(args):
                             print('        CONFIRMED: single-sided TWR clock error.')
                         else:
                             print('        NOT explained by reply time.')
+            # --- self-consistency: needs redundancy, not truth ------------
+            if len(live) >= 4:
+                acs = {k: anchors[k] for k in live}
+                rng_ = {k: live[k][0] for k in live}
+                p0 = anchors[min(anchors)] + np.array([0.0, 0.0, 1.0])
+                if p_true is not None:
+                    p0 = p_true
+                elif r in uwb and uwb[r]:
+                    p0 = np.array(uwb[r][-1][1:4])
+                p_fit = solve_pos(acs, rng_, p0)
+                loo = leave_one_out(acs, rng_, p0)
+                print()
+                print('      --- self-consistency (no ground truth needed) ---')
+                if p_fit is not None:
+                    print(f'      position from all {len(live)} ranges: '
+                          f'{p_fit[0]:+.3f} {p_fit[1]:+.3f} {p_fit[2]:+.3f}')
+                print(f'      {"held out":>9} {"measured":>9} {"predicted":>10} '
+                      f'{"residual":>10} {"others fit":>11}')
+                print('      ' + '-' * 60)
+                for slot in sorted(loo):
+                    pred, res, inner = loo[slot]
+                    print(f'      {"A"+str(slot):>9} {rng_[slot]:>9.3f} '
+                          f'{pred:>10.3f} {res*1000:>+9.0f}mm '
+                          f'{inner*1000:>9.0f}mm')
+                print('      ' + '-' * 60)
+                # The culprit is the anchor whose removal leaves the cleanest set.
+                culprit = min(loo, key=lambda k: loo[k][2])
+                c_pred, c_res, c_inner = loo[culprit]
+                others = [loo[k][2] for k in loo if k != culprit]
+                margin = (min(others) / c_inner) if c_inner > 1e-9 and others else 1.0
+                if abs(c_res) > 0.08 and margin > 2.0:
+                    print(f'      A{culprit} IS THE OUTLIER: {c_res*1000:+.0f} mm off, and')
+                    print(f'      removing it leaves the other anchors agreeing to')
+                    print(f'      {c_inner*1000:.0f} mm -- {margin:.1f}x better than excluding any')
+                    print('      other. Large residuals elsewhere are that fault being')
+                    print('      absorbed into the solve, not separate problems.')
+                elif max(abs(v[1]) for v in loo.values()) > 0.08:
+                    print('      Residuals are large but no single anchor stands out.')
+                    print('      Either more than one link is bad, or the configured')
+                    print('      coordinates are wrong. Re-measure with anchor_solve.py.')
+                else:
+                    print('      All anchors mutually consistent. Any remaining error is')
+                    print('      COMMON to all of them -- invisible to this test by')
+                    print('      construction, and only ground truth can reveal it.')
+            elif len(live) == 3:
+                print()
+                print('      only 3 anchors: zero redundancy, so no self-consistency')
+                print('      check is possible. Add D3,D4 to --slots for all five.')
             print()
 
     if not anchor_slots:
@@ -671,7 +793,7 @@ def cmd_ranges(args):
         print()
 
     # ---------------- chords ----------------------------------------------
-    chord_slots = sorted(i for i in dcol if i >= N_ANCHOR_SLOTS)
+    chord_slots = sorted(i for i in dcol if i not in role_anchor)
     if not chord_slots:
         print('(no chord slots in --slots; add D3,D4 to check the chords)')
         return
@@ -935,6 +1057,10 @@ def main():
     g.add_argument('--with-reply', action='store_true',
                    help='the log block carries hmD0..2 THEN hmRT0..2 (6 floats, '
                         'exactly one block) -- enables the eps regression')
+    g.add_argument('--anchor-slots', default='0,1,2',
+                   help='which log slots hold ANCHORS (the rest are chords). '
+                        'Use 0,1,2,3,4 when hmLId3/hmLId4 point at anchors '
+                        'instead of Crazyflies. default: 0,1,2')
     g.add_argument('--anchor-subjects', nargs='+', default=['A0', 'A1', 'A2'],
                    help='Vicon subject names for the anchors (a _gt-style '
                         'suffix is ignored)')
