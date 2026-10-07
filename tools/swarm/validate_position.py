@@ -606,6 +606,29 @@ def cmd_ranges(args):
 
     arr = {r: np.array(v, dtype=float) for r, v in rng.items() if v}
 
+    # The log block's width must match what --slots declares, or every column
+    # index is off and the failure shows up as nonsense rather than an error.
+    ncols = max(len(dcol) + len(rcol), 0)
+    for r, a in arr.items():
+        got = a.shape[1] - 1                      # column 0 is the timestamp
+        if got != ncols:
+            want = ', '.join(
+                f'"tdoa3.hm{"RT" if k == "RT" else "D"}{i}"'
+                for k, i in ([('D', i) for i in sorted(dcol)]
+                             + [('RT', i) for i in sorted(rcol)]))
+            sys.exit(
+                f'ERROR: /{r}/{args.topic} publishes {got} value(s), but --slots '
+                f'declares {ncols}.\n\n'
+                f'  --slots {spec}  expects the log block to be exactly:\n'
+                f'      vars: [{want}]\n\n'
+                '  Update crazyflies.yaml to match (or change --slots to match\n'
+                '  the topic), then restart crazyflie_server.')
+        if np.all(a[:, 1:] == 0.0):
+            print(f'  WARNING: every value on /{r}/{args.topic} is 0.0, the')
+            print('  "no measurement" sentinel. The slots are configured for ids')
+            print('  that are not being ranged -- check tdoa3.hmLId0..hmLId5.')
+            print()
+
     # ---------------- anchors ----------------------------------------------
     try:
         role_anchor = {int(x) for x in args.anchor_slots.split(',') if x.strip()}
