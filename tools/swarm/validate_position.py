@@ -44,6 +44,7 @@ against a Vicon stream that is already inside it, and it will look excellent.
 
 import argparse
 import json
+import itertools
 import math
 import re
 import sys
@@ -761,6 +762,32 @@ def cmd_ranges(args):
                             print('        CONFIRMED: single-sided TWR clock error.')
                         else:
                             print('        NOT explained by reply time.')
+            # --- triangle inequality: the cheapest possible sanity check --
+            # |r_i - r_j| can never exceed |A_i - A_j|. This needs no position
+            # solve, no truth and no redundancy -- it works with 2 anchors --
+            # and a violation proves the range set is impossible rather than
+            # merely noisy. Means over hundreds of samples are precise to a
+            # couple of mm, so any violation is systematic.
+            if len(live) >= 2:
+                viol = []
+                for i, j in itertools.combinations(sorted(live), 2):
+                    sep = float(np.linalg.norm(anchors[i] - anchors[j]))
+                    dr = abs(live[i][0] - live[j][0])
+                    if dr > sep:
+                        viol.append((i, j, dr - sep, sep, dr))
+                if viol:
+                    print()
+                    print('      *** IMPOSSIBLE RANGE SET ***')
+                    print(f'      {"pair":>8} {"|Ai-Aj|":>9} {"|ri-rj|":>9} {"excess":>9}')
+                    for i, j, ex, sep, dr in viol:
+                        print(f'      {"A"+str(i)+"-A"+str(j):>8} {sep:>9.4f} '
+                              f'{dr:>9.4f} {ex*1000:>+8.0f} mm')
+                    print('      No point in space satisfies these ranges. At least one')
+                    print('      of: a wrong anchor COORDINATE, a wrong id->anchor')
+                    print('      mapping (hmLId*), or a biased link. Fix this before')
+                    print('      interpreting anything else -- the position solve is')
+                    print('      meaningless while the inputs are contradictory.')
+
             # --- self-consistency: needs redundancy, not truth ------------
             if len(live) >= 4:
                 acs = {k: anchors[k] for k in live}
