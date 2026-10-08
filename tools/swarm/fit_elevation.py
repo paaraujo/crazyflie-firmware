@@ -45,6 +45,9 @@ import numpy as np
 # Geometry. The encirclement centre sits at altitude h above the anchor plane;
 # it is NOT the corner anchor (theory.tex, Remark "the centre is not the corner").
 # ----------------------------------------------------------------------------
+# Defaults for the EXAMPLE waypoint sets below, which were all sketched on a
+# 1 m sphere about a centre 1 m up. Override with --centre and --radius to
+# match a real template, or sidestep 3D waypoints entirely with --angles.
 CENTRE = np.array([0.0, 0.0, 1.00])   # c = h * e_z
 RADIUS = 1.00                         # r
 
@@ -90,6 +93,56 @@ CURVE_NAME = 'B: three-lobed crown'
 #     [ 0.308, -0.947,  1.087],   # theta 288 deg, b =  -5 deg
 # ])
 # CURVE_NAME = 'C: asymmetric sweep'
+
+
+
+def waypoints_from_angles(spec, centre, radius):
+    """Build 3D waypoints from "theta_deg:b_deg" pairs.
+
+    This is usually what you actually want. b(theta) is an ANGLE, so the fitted
+    coefficients are scale-free -- the same a_k / b_k describe a similar curve
+    at any radius. Entering waypoints as angles therefore states the intent
+    directly and cannot be invalidated by a later change of radius, whereas 3D
+    points are tied to the centre and radius they were sketched for.
+    """
+    out = []
+    for item in spec:
+        try:
+            th_s, b_s = item.split(':')
+            th = math.radians(float(th_s))
+            b = math.radians(float(b_s))
+        except ValueError:
+            raise SystemExit(
+                f'ERROR: cannot parse --angles entry "{item}". '
+                'Expected theta_deg:b_deg, e.g. 0:-20 90:20')
+        cb, sb = math.cos(b), math.sin(b)
+        out.append([centre[0] + radius * cb * math.cos(th),
+                    centre[1] + radius * cb * math.sin(th),
+                    centre[2] - radius * sb])
+    return np.array(out)
+
+
+def warn_radius_mismatch(waypoints, centre, radius):
+    """Flag waypoints that were sketched for a different radius.
+
+    Silent failure here is expensive: the fit would still converge, on angles
+    recovered from the wrong sphere, and produce plausible coefficients for a
+    curve nobody intended.
+    """
+    rho = np.linalg.norm(waypoints - centre, axis=1)
+    med = float(np.median(rho))
+    if abs(med - radius) > 0.1 * max(radius, 1e-6):
+        print()
+        print('  *** RADIUS MISMATCH ***')
+        print(f'  waypoints sit a median {med:.3f} m from the centre, but')
+        print(f'  --radius says {radius:.3f} m. The built-in example sets were')
+        print('  sketched on a 1 m sphere about (0, 0, 1.0).')
+        print('  Either pass --centre/--radius to match them, or state the')
+        print('  curve as angles instead:')
+        print('      --angles 0:-20 90:20 180:-20 270:20')
+        print()
+        return True
+    return False
 
 
 # ----------------------------------------------------------------------------
@@ -216,23 +269,35 @@ def report_sweep(rows, accepted, b):
     print()
 
 
+CENTRE_OUT = None
+RADIUS_OUT = None
+
+
 def report_coeffs(K, coeffs):
     names = ['b0'] + [f'{c}{k}' for k in range(1, K + 1) for c in ('a', 'b')]
     print('--- firmware coefficients ---')
     for n, v in zip(names, coeffs):
-        print(f'    swarm.{n:<4} = {v:+.6f}')
+        print(f'    swarmCurve.{n:<4} = {v:+.6f}')
     print()
     print('  cflib:')
     print('    PARAMS = {')
-    print(f"        'swarm.K': {K},")
+    print(f"        'swarmCurve.K': {K},")
     for n, v in zip(names, coeffs):
-        print(f"        'swarm.{n}': {v:+.6f},")
+        print(f"        'swarmCurve.{n}': {v:+.6f},")
     print('    }')
     print()
     print('  crazyswarm2 crazyflies.yaml:')
     print('    all:')
     print('      firmware_params:')
-    print('        swarm:')
+    print('        swarmCurve:')
+    # The centre and radius are part of the curve: the coefficients are
+    # angles about THIS centre, so emitting them together keeps the
+    # block self-consistent and directly pasteable.
+    if CENTRE_OUT is not None:
+        print(f'          cx: {CENTRE_OUT[0]:.4f}')
+        print(f'          cy: {CENTRE_OUT[1]:.4f}')
+        print(f'          cz: {CENTRE_OUT[2]:.4f}')
+        print(f'          r:  {RADIUS_OUT:.4f}')
     print(f'          K: {K}')
     for n, v in zip(names, coeffs):
         print(f'          {n}: {v:+.6f}')
@@ -243,23 +308,34 @@ def report_coeffs(K, coeffs):
 # Plots
 # ----------------------------------------------------------------------------
 
-def make_plots(theta, b, coeffs, K, prefix):
+def make_plots(theta, b, coeffs, K, prefix,
+               waypoints, centre, radius, name):
     try:
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
-        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
     except Exception as e:
         print(f'(plots skipped: {e})')
         return
 
+    # Axes3D is optional. A mixed matplotlib install -- a pip version paired
+    # with mpl_toolkits from the older system package -- breaks the 3D
+    # projection while leaving 2D perfectly usable. Guarding it separately
+    # means one broken import costs one panel rather than the whole figure.
+    try:
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+        have_3d = True
+    except Exception as e:
+        have_3d = False
+        print(f'(3D panel replaced with a 2D height profile: {e})')
+
     dense = np.linspace(0, 2 * np.pi, 721)
     b_dense = eval_b(coeffs, dense)
-    q = eval_q(coeffs, dense, CENTRE, RADIUS)
-    flat = eval_q(np.array([0.0]), dense, CENTRE, RADIUS)
+    q = eval_q(coeffs, dense, centre, radius)
+    flat = eval_q(np.array([0.0]), dense, centre, radius)
 
     fig = plt.figure(figsize=(13, 10))
-    fig.suptitle(f'Elevation profile fit  --  {CURVE_NAME}  (K = {K})',
+    fig.suptitle(f'Elevation profile fit  --  {name}  (K = {K})',
                  fontsize=13, fontweight='bold')
 
     # (1) elevation profile ---------------------------------------------------
@@ -285,39 +361,62 @@ def make_plots(theta, b, coeffs, K, prefix):
     ax.set_title('elevation profile (overshoot is between the waypoints)',
                  fontsize=10)
 
-    # (2) 3D trajectory -------------------------------------------------------
-    ax = fig.add_subplot(2, 2, 2, projection='3d')
-    # faint sphere: the curve provably lies on it (norm(q - c) = r)
-    u, v = np.mgrid[0:2 * np.pi:40j, 0:np.pi:20j]
-    ax.plot_wireframe(CENTRE[0] + RADIUS * np.cos(u) * np.sin(v),
-                      CENTRE[1] + RADIUS * np.sin(u) * np.sin(v),
-                      CENTRE[2] + RADIUS * np.cos(v),
-                      color='k', alpha=0.06, lw=0.5)
-    ax.plot(flat[:, 0], flat[:, 1], flat[:, 2], color='#7f7f7f', ls='--',
-            lw=1.2, label='flat circle (b=0)')
-    ax.plot(q[:, 0], q[:, 1], q[:, 2], lw=2.5, color='#1f77b4',
-            label='embedded curve')
-    ax.scatter(WAYPOINTS[:, 0], WAYPOINTS[:, 1], WAYPOINTS[:, 2],
-               s=60, color='#d62728', depthshade=False, zorder=5,
-               label='waypoints')
-    ax.scatter(*CENTRE, s=50, marker='x', color='k', label='centre c')
-    ax.set_xlabel('x [m]'); ax.set_ylabel('y [m]'); ax.set_zlabel('z [m]')
-    ax.set_box_aspect((1, 1, 1))
-    ax.legend(fontsize=8, loc='upper left')
-    ax.set_title('trajectory on the sphere about c', fontsize=10)
+    # (2) trajectory ----------------------------------------------------------
+    if have_3d:
+        ax = fig.add_subplot(2, 2, 2, projection='3d')
+        # faint sphere: the curve provably lies on it (norm(q - c) = r)
+        u, v = np.mgrid[0:2 * np.pi:40j, 0:np.pi:20j]
+        ax.plot_wireframe(centre[0] + radius * np.cos(u) * np.sin(v),
+                          centre[1] + radius * np.sin(u) * np.sin(v),
+                          centre[2] + radius * np.cos(v),
+                          color='k', alpha=0.06, lw=0.5)
+        ax.plot(flat[:, 0], flat[:, 1], flat[:, 2], color='#7f7f7f', ls='--',
+                lw=1.2, label='flat circle (b=0)')
+        ax.plot(q[:, 0], q[:, 1], q[:, 2], lw=2.5, color='#1f77b4',
+                label='embedded curve')
+        ax.scatter(waypoints[:, 0], waypoints[:, 1], waypoints[:, 2],
+                   s=60, color='#d62728', depthshade=False, zorder=5,
+                   label='waypoints')
+        ax.scatter(*centre, s=50, marker='x', color='k', label='centre c')
+        ax.set_xlabel('x [m]'); ax.set_ylabel('y [m]'); ax.set_zlabel('z [m]')
+        ax.set_box_aspect((1, 1, 1))
+        ax.legend(fontsize=8, loc='upper left')
+        ax.set_title('trajectory on the sphere about c', fontsize=10)
+    else:
+        # Height against phase: the same vertical information the 3D view
+        # carries, and arguably the more actionable form -- it is what decides
+        # ground and ceiling clearance.
+        ax = fig.add_subplot(2, 2, 2)
+        ax.plot(np.degrees(dense), q[:, 2], lw=2.5, color='#1f77b4',
+                label='embedded curve')
+        ax.axhline(centre[2], color='#7f7f7f', ls='--', lw=1.2,
+                   label=f'flat circle (b=0), z = {centre[2]:.2f} m')
+        ax.plot(np.degrees(theta), waypoints[:, 2], 'o', ms=8,
+                color='#d62728', zorder=5, label='waypoints')
+        ax.axhline(0.0, color='k', lw=1.0, alpha=0.5)
+        ax.text(5, 0.01, 'anchor plane', fontsize=7, alpha=0.6)
+        lo, hi = q[:, 2].min(), q[:, 2].max()
+        ax.set_title(f'height vs phase   (span {hi - lo:.2f} m, '
+                     f'min {lo:.2f} m)', fontsize=10)
+        ax.set_xlabel('phase theta [deg]')
+        ax.set_ylabel('z above the anchor plane [m]')
+        ax.set_xlim(0, 360)
+        ax.set_xticks(range(0, 361, 45))
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8, loc='best')
 
     # (3) top view: azimuth is preserved exactly -------------------------------
     ax = fig.add_subplot(2, 2, 3)
     ax.plot(flat[:, 0], flat[:, 1], color='#7f7f7f', ls='--', lw=1.2,
             label='flat circle')
     ax.plot(q[:, 0], q[:, 1], lw=2, color='#1f77b4', label='curve (top view)')
-    for wp, t in zip(WAYPOINTS, theta):
-        ax.plot([CENTRE[0], CENTRE[0] + 1.35 * RADIUS * np.cos(t)],
-                [CENTRE[1], CENTRE[1] + 1.35 * RADIUS * np.sin(t)],
+    for wp, t in zip(waypoints, theta):
+        ax.plot([centre[0], centre[0] + 1.35 * radius * np.cos(t)],
+                [centre[1], centre[1] + 1.35 * radius * np.sin(t)],
                 color='#d62728', lw=0.8, alpha=0.55)
-    ax.plot(WAYPOINTS[:, 0], WAYPOINTS[:, 1], 'o', ms=8, color='#d62728',
+    ax.plot(waypoints[:, 0], waypoints[:, 1], 'o', ms=8, color='#d62728',
             zorder=5, label='waypoint shadows')
-    ax.plot(CENTRE[0], CENTRE[1], 'kx', ms=9)
+    ax.plot(centre[0], centre[1], 'kx', ms=9)
     ax.set_aspect('equal')
     ax.set_xlabel('x [m]'); ax.set_ylabel('y [m]')
     ax.grid(alpha=0.3)
@@ -350,16 +449,45 @@ def make_plots(theta, b, coeffs, K, prefix):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description='Fit an elevation profile b(theta) for swarmCurve.')
     ap.add_argument('--no-plot', action='store_true')
     ap.add_argument('--out', default='elevation_fit')
+    ap.add_argument('--centre', default=None,
+                    help='encirclement centre as x,y,z [m]. Must match '
+                         'swarmCurve.cx/cy/cz.')
+    ap.add_argument('--radius', type=float, default=None,
+                    help='orbit radius [m]. Must match swarmCurve.r.')
+    ap.add_argument('--angles', nargs='+', default=None,
+                    help='waypoints as theta_deg:b_deg pairs, e.g. '
+                         '0:-20 90:20 180:-20 270:20. Preferred over the '
+                         'built-in 3D sets: angles are scale-free, so the fit '
+                         'cannot be invalidated by a change of radius.')
     args = ap.parse_args()
 
-    print(f'curve: {CURVE_NAME}')
-    print(f'centre c = {CENTRE.tolist()},  radius r = {RADIUS} m')
-    print(f'{len(WAYPOINTS)} waypoints\n')
+    centre = CENTRE if args.centre is None else np.array(
+        [float(v) for v in args.centre.split(',')])
+    if centre.shape != (3,):
+        raise SystemExit('ERROR: --centre must be x,y,z')
+    radius = RADIUS if args.radius is None else args.radius
+    if radius <= 0:
+        raise SystemExit('ERROR: --radius must be positive')
 
-    theta, b, slip, rho = project(WAYPOINTS, CENTRE, RADIUS)
+    if args.angles:
+        waypoints = waypoints_from_angles(args.angles, centre, radius)
+        name = f'angles: {" ".join(args.angles)}'
+    else:
+        waypoints = WAYPOINTS
+        name = CURVE_NAME
+
+    print(f'curve: {name}')
+    print(f'centre c = {centre.tolist()},  radius r = {radius} m')
+    print(f'{len(waypoints)} waypoints')
+    if not args.angles:
+        warn_radius_mismatch(waypoints, centre, radius)
+    print()
+
+    theta, b, slip, rho = project(waypoints, centre, radius)
     report_projection(theta, b, slip, rho)
 
     dense = np.linspace(0, 2 * np.pi, 2001)
@@ -367,10 +495,19 @@ def main():
     report_sweep(rows, accepted, b)
 
     K, coeffs = accepted
+    globals()['CENTRE_OUT'] = centre
+    globals()['RADIUS_OUT'] = radius
     report_coeffs(K, coeffs)
 
+    print()
+    print('  Reminder: these coefficients are ANGLES and therefore scale-free.')
+    print(f'  They stay valid if swarmCurve.r changes; the curve then rescales')
+    print(f'  uniformly. Set swarmCurve.cx/cy/cz = {centre.tolist()} and')
+    print(f'  swarmCurve.r = {radius} to fly the curve as fitted.')
+
     if not args.no_plot:
-        make_plots(theta, b, coeffs, K, args.out)
+        make_plots(theta, b, coeffs, K, args.out,
+                   waypoints, centre, radius, name)
 
 
 if __name__ == '__main__':
