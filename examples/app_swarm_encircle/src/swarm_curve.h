@@ -46,6 +46,16 @@ typedef struct {
   float cy;
   float cz;   // the altitude h of the theory
 
+  // Nominal orbit radius. The EKF still ESTIMATES the radius as a state; this
+  // is the commanded value the controller drives towards, and it lives here
+  // rather than in the controller because it completes the curve's geometry.
+  //
+  // Note b(theta) is an ANGLE, so alpha/beta are dimensionless and scale-free:
+  // changing r does not detune the elevation profile, it rescales the whole
+  // curve, vertical extent included. At b = -25 deg the vehicle sits
+  // 0.42 m above the centre when r = 1.0 and 0.25 m when r = 0.6.
+  float r;
+
   uint8_t K;                        // harmonic order in use, 0..SWARM_CURVE_KMAX
   float b0;                         // beta_0
   float alpha[SWARM_CURVE_KMAX];    // alpha_1 .. alpha_K

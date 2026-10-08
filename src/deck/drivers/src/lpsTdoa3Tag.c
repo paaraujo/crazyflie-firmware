@@ -108,7 +108,7 @@ for improved position estimation.
 // Number of simultaneously logged TWR distances in hybrid mode. Sized for the
 // swarm-encirclement use case: three template anchors plus a leader and a
 // follower, with one slot spare.
-#define HM_LOG_SLOTS 6
+#define HM_LOG_SLOTS 8
 
 // A logged distance older than this is considered stale and is reported as
 // exactly 0.0 m. Without this the log variable would silently retain the last
@@ -411,9 +411,27 @@ static bool twrOutlierFilter(tdoaAnchorContext_t* anchorCtx, const float distanc
   if (accepted) {
     info->twrHistory[info->twrHistoryIndex] = distance;
     info->twrHistoryIndex = (info->twrHistoryIndex + 1) % TWR_HISTORY_LENGTH;
+    info->twrRejectRun = 0;
+    return true;
   }
 
-  return accepted;
+  // A sustained run of rejections means the median is stale, not that the
+  // measurements are bad: the vehicle has moved beyond the threshold and the
+  // window cannot follow because it only advances on accepts. Discard the
+  // history and let it refill, so a link can always be re-acquired. Without
+  // this the filter latches off, the estimator loses that anchor entirely,
+  // and with enough anchors gone the position diverges to the supervisor
+  // bound -- which looks like a UWB failure but is self-inflicted.
+  if (info->twrRejectRun < 255) {
+    info->twrRejectRun++;
+  }
+  if (info->twrRejectRun >= TWR_MAX_REJECT_RUN) {
+    info->twrHistoryCount = 0;
+    info->twrHistoryIndex = 0;
+    info->twrRejectRun = 0;
+  }
+
+  return false;
 }
 
 static void processTwoWayRanging(tdoaAnchorContext_t* anchorCtx, const uint32_t now_ms, const uint64_t txAn_in_cl_An, const uint64_t rxAn_by_T_in_cl_T) {
@@ -953,6 +971,12 @@ LOG_GROUP_START(tdoa3)
    */
   LOG_ADD(LOG_FLOAT, hmD5, &ctx.logDistances[5])
 
+  /** @brief Measured distance to the remote in hmLId6 [m]. 0 = no recent measurement. */
+  LOG_ADD(LOG_FLOAT, hmD6, &ctx.logDistances[6])
+
+  /** @brief Measured distance to the remote in hmLId7 [m]. 0 = no recent measurement. */
+  LOG_ADD(LOG_FLOAT, hmD7, &ctx.logDistances[7])
+
   /**
    * @brief Reply time of the most recent TWR sample [ms]. Long replies amplify
    * clock correction error into large range errors.
@@ -979,6 +1003,12 @@ LOG_GROUP_START(tdoa3)
 
   /** @brief Reply time for the remote in hmLId5 [ms] */
   LOG_ADD(LOG_FLOAT, hmRT5, &ctx.logReplyTimes[5])
+
+  /** @brief Reply time for the remote in hmLId6 [ms] */
+  LOG_ADD(LOG_FLOAT, hmRT6, &ctx.logReplyTimes[6])
+
+  /** @brief Reply time for the remote in hmLId7 [ms] */
+  LOG_ADD(LOG_FLOAT, hmRT7, &ctx.logReplyTimes[7])
 
   /**
    * @brief Clock correction of the most recent TWR sample, as deviation from
@@ -1081,6 +1111,18 @@ PARAM_ADD(PARAM_FLOAT, stddev, &ctx.tdoaStdDev)
    * @brief Remote id whose distance is reported in the tdoa3.hmD5 log variable.
    */
   PARAM_ADD(PARAM_UINT8, hmLId5, &ctx.logDistIds[5])
+
+  /**
+   * @brief Remote id whose distance is reported in the tdoa3.hmD6 log variable.
+   * Volatile: resets to 6 on reboot and on any loco mode switch.
+   */
+  PARAM_ADD(PARAM_UINT8, hmLId6, &ctx.logDistIds[6])
+
+  /**
+   * @brief Remote id whose distance is reported in the tdoa3.hmD7 log variable.
+   * Volatile: resets to 7 on reboot and on any loco mode switch.
+   */
+  PARAM_ADD(PARAM_UINT8, hmLId7, &ctx.logDistIds[7])
 
   /**
    * @brief Reject TWR samples whose reply time exceeds this [ms]. 0 disables.

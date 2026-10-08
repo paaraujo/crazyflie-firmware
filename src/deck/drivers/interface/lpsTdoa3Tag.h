@@ -12,7 +12,7 @@ extern uwbAlgorithm_t uwbTdoa3TagAlgorithm;
 #ifdef CONFIG_DECK_LOCO_TDOA3_HYBRID_MODE
 
 /** Number of hybrid-mode TWR logging slots. Must match lpsTdoa3Tag.c. */
-#define HYBRID_RANGE_SLOTS 6
+#define HYBRID_RANGE_SLOTS 8
 
 /**
  * Read one hybrid-mode two-way-ranging slot.

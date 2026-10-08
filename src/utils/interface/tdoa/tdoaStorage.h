@@ -15,6 +15,13 @@
 // while keeping the lag small enough to track a moving Crazyflie.
 #define TWR_HISTORY_LENGTH 9
 #define TWR_OUTLIER_TH 4
+
+// Consecutive rejections after which the history is discarded and refilled.
+// The median only advances on ACCEPTED samples, so without this a vehicle that
+// moves further than the threshold in one window can never be re-acquired: the
+// median stays behind, every later sample is rejected, and that link goes dark
+// permanently. At ~50 Hz this is roughly 0.4 s of silence before re-seeding.
+#define TWR_MAX_REJECT_RUN 20
 #endif
 
 typedef struct {
@@ -55,6 +62,7 @@ typedef struct {
   // single gross outlier cannot poison the statistic that rejects it.
   float twrHistory[TWR_HISTORY_LENGTH];
   uint8_t twrHistoryCount;
+  uint8_t twrRejectRun;      // consecutive rejections, for lock-out recovery
   uint8_t twrHistoryIndex;
   #endif
 } tdoaAnchorInfo_t;

@@ -53,7 +53,7 @@ int main(void) {
     swarmEkf_t f;
     swarmEkfDefaults(&f);
     swarmEkfInit(&f, 0.3f, 1.0f, DNOM);
-    f.qTheta = f.qDelta = f.qOmega = f.qR = 0.0f;   /* isolate F P F' */
+    f.qTheta = f.qDelta = f.qOmega = f.qR = f.qZ = 0.0f; /* isolate F P F' */
 
     /* seed a non-trivial symmetric P */
     float P0[SWARM_EKF_DIM][SWARM_EKF_DIM];
@@ -271,6 +271,63 @@ int main(void) {
     check("P: max asymmetry over 2000 steps", worstAsym, 0.0, 1e-9);
     checks++;
     if (!(minDiag > 0.0)) { printf("  FAIL  P diagonal went non-positive\n"); failures++; }
+  }
+
+  /* -----------------------------------------------------------------
+   * dz: the vertical offset state.
+   * ----------------------------------------------------------------- */
+  {
+    /* (a) the Jacobian entry is the vertical cosine, so an anchor directly
+     *     below the vehicle informs dz fully and one at the same height not
+     *     at all. Check the two extremes via the covariance reduction. */
+    swarmCurve_t c = {0};
+    c.cx = 0.0f; c.cy = 0.0f; c.cz = 1.0f; c.K = 0; c.b0 = 0.0f;
+
+    swarmEkf_t f;
+    swarmEkfDefaults(&f);
+    swarmEkfInit(&f, 0.0f, 1.0f, DNOM);
+    const float pz0 = f.P[SWARM_EKF_DZ][SWARM_EKF_DZ];
+    /* anchor directly beneath the vehicle: line of sight is vertical */
+    const float below[3] = {1.0f, 0.0f, 0.0f};
+    swarmEkfUpdateAnchor(&f, &c, below, 1.0f, 0.02f, 0.0f);
+    const float pzBelow = f.P[SWARM_EKF_DZ][SWARM_EKF_DZ];
+
+    swarmEkfInit(&f, 0.0f, 1.0f, DNOM);
+    /* anchor at the SAME height: line of sight is horizontal, e_z = 0 */
+    const float level[3] = {-1.0f, 0.0f, 1.0f};
+    swarmEkfUpdateAnchor(&f, &c, level, 2.0f, 0.02f, 0.0f);
+    const float pzLevel = f.P[SWARM_EKF_DZ][SWARM_EKF_DZ];
+
+    check("dz: vertical anchor reduces P_dz", pzBelow < 0.5f * pz0 ? 1.0f : 0.0f,
+          1.0f, 0.5f);
+    check("dz: level anchor leaves P_dz alone", pzLevel, pz0, 1e-6f);
+
+    /* (b) a real altitude offset is recovered rather than leaking into theta.
+     *     Truth sits 0.15 m above the modelled ring; feed consistent ranges
+     *     from four anchors and check dz converges while theta stays put. */
+    const float anchors[4][3] = {
+      {0.0f, 0.0f, 0.0f}, {0.62f, 0.0f, 0.0f},
+      {0.0f, 0.65f, 0.0f}, {0.31f, 0.30f, 0.20f},
+    };
+    const float thTrue = 0.9f, rTrue = 0.7f, dzTrue = 0.15f;
+    swarmEkfInit(&f, thTrue, rTrue, DNOM);   /* seeded at truth except dz */
+
+    for (int it = 0; it < 400; it++) {
+      for (int a = 0; a < 4; a++) {
+        float qt[3];
+        swarmCurveQ(&c, thTrue, rTrue, qt);
+        qt[2] += dzTrue;                     /* the TRUE vehicle position */
+        const float dx = qt[0] - anchors[a][0];
+        const float dy = qt[1] - anchors[a][1];
+        const float dz = qt[2] - anchors[a][2];
+        const float d = sqrtf(dx*dx + dy*dy + dz*dz);
+        swarmEkfUpdateAnchor(&f, &c, anchors[a], d, 0.026f, 0.0f);
+      }
+      swarmEkfPredict(&f, 0.0f, 0.01f);
+    }
+    check("dz: offset recovered", f.x[SWARM_EKF_DZ], dzTrue, 0.02f);
+    check("dz: theta not corrupted", f.x[SWARM_EKF_TH], thTrue, 0.03f);
+    check("dz: radius not corrupted", f.x[SWARM_EKF_R], rTrue, 0.03f);
   }
 
   printf("\n%d checks, %d failures\n", checks, failures);

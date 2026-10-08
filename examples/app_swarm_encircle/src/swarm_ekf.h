@@ -54,7 +54,7 @@
 
 #include "swarm_curve.h"
 
-#define SWARM_EKF_DIM 5
+#define SWARM_EKF_DIM 6
 
 // State indices
 #define SWARM_EKF_TH 0   // theta_i, common phase
@@ -62,6 +62,19 @@
 #define SWARM_EKF_DJ 2   // delta_j, follower formation error
 #define SWARM_EKF_WE 3   // omega_e, angular rate error
 #define SWARM_EKF_R  4   // r, encirclement radius
+#define SWARM_EKF_DZ 5   // dz, vertical offset from the MODELLED curve [m]
+//
+// dz exists because the curve fixes altitude analytically (q_z = cz for a flat
+// ring), and without a height sensor nothing guarantees the vehicle is at that
+// altitude. Left unmodelled, any real altitude offset leaks into theta: the
+// sensitivity is 26-43 deg per metre for a compact anchor set, so a 10 cm error
+// is several degrees of phase bias. Estimating it costs almost nothing in phase
+// accuracy (4.01 -> 4.15 deg at r = 0.6 m) because theta moves the vehicle
+// tangentially while dz moves it vertically, and ranges separate those two
+// directions well even when they cannot separate the two horizontal ones.
+//
+// It is an OFFSET, not an absolute altitude: dz = 0 reproduces the pure curve
+// model exactly, so swarmCurve.cz stays the nominal orbit height.
 
 typedef struct {
   float x[SWARM_EKF_DIM];
@@ -72,6 +85,7 @@ typedef struct {
   float qDelta;
   float qOmega;
   float qR;
+  float qZ;
 
   // Initial covariance, applied by swarmEkfInit. Diagonal only: there is no
   // reason to assume the states are correlated before any measurement.
@@ -88,6 +102,7 @@ typedef struct {
   float p0Delta;
   float p0Omega;
   float p0R;
+  float p0Z;
 
   float dNom;        // nominal spacing 2*pi/n [rad]
   bool initialised;

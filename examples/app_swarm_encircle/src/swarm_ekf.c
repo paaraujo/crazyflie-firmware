@@ -22,6 +22,7 @@ void swarmEkfDefaults(swarmEkf_t* f) {
   f->qDelta = 1e-5f;
   f->qOmega = 1e-4f;
   f->qR     = 1e-5f;
+  f->qZ     = 1e-4f;   // altitude wanders more than the radius does
 
   // Initial covariance (variances). theta and r are seeded from an independent
   // source and trusted moderately; the formation errors are unknown until the
@@ -30,6 +31,7 @@ void swarmEkfDefaults(swarmEkf_t* f) {
   f->p0Delta = 0.50f;   // (0.71 rad)^2 ~ 40 deg one sigma
   f->p0Omega = 0.25f;   // (0.5 rad/s)^2
   f->p0R     = 0.09f;   // (0.3 m)^2
+  f->p0Z     = 0.04f;   // (0.2 m)^2 -- cz should be right to roughly this
 }
 
 /** Accept a configured variance only if it is positive, finite and sane. */
@@ -58,12 +60,14 @@ void swarmEkfInit(swarmEkf_t* f, const float theta0, const float r0, const float
   const float pD  = p0OrDefault(f->p0Delta, 0.50f);
   const float pW  = p0OrDefault(f->p0Omega, 0.25f);
   const float pR  = p0OrDefault(f->p0R,     0.09f);   // (0.3 m)^2
+  const float pZ  = p0OrDefault(f->p0Z,     0.04f);   // (0.2 m)^2
 
   f->P[SWARM_EKF_TH][SWARM_EKF_TH] = pTh;
   f->P[SWARM_EKF_DK][SWARM_EKF_DK] = pD;
   f->P[SWARM_EKF_DJ][SWARM_EKF_DJ] = pD;
   f->P[SWARM_EKF_WE][SWARM_EKF_WE] = pW;
   f->P[SWARM_EKF_R][SWARM_EKF_R]   = pR;
+  f->P[SWARM_EKF_DZ][SWARM_EKF_DZ] = pZ;
 
   f->dNom = dNom;
   f->lastNis = 0.0f;
@@ -105,6 +109,7 @@ void swarmEkfPredict(swarmEkf_t* f, const float wz, const float dt) {
   f->P[SWARM_EKF_DJ][SWARM_EKF_DJ] += f->qDelta * dt;
   f->P[SWARM_EKF_WE][SWARM_EKF_WE] += f->qOmega * dt;
   f->P[SWARM_EKF_R][SWARM_EKF_R]   += f->qR * dt;
+  f->P[SWARM_EKF_DZ][SWARM_EKF_DZ] += f->qZ * dt;
 }
 
 /**
@@ -185,6 +190,7 @@ bool swarmEkfUpdateAnchor(swarmEkf_t* f, const swarmCurve_t* curve,
   swarmCurveQ(curve, th, r, q);
   swarmCurveDq(curve, th, r, dq);
   swarmCurveU(curve, th, u);
+  q[2] += f->x[SWARM_EKF_DZ];   // the vehicle need not sit exactly on the curve
 
   const float v[3] = {q[0] - anchor[0], q[1] - anchor[1], q[2] - anchor[2]};
   const float h = sqrtf(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
@@ -196,6 +202,7 @@ bool swarmEkfUpdateAnchor(swarmEkf_t* f, const swarmCurve_t* curve,
   float H[DIM] = {0};
   H[SWARM_EKF_TH] = e[0]*dq[0] + e[1]*dq[1] + e[2]*dq[2];
   H[SWARM_EKF_R]  = e[0]*u[0]  + e[1]*u[1]  + e[2]*u[2];
+  H[SWARM_EKF_DZ] = e[2];      // d(range)/d(dz) is just the vertical cosine
   // The corner anchor is NOT special-cased: with the encirclement centre above
   // the anchor plane its phase sensitivity is h*q_z'/d_0, which is non-zero.
 
@@ -222,6 +229,14 @@ bool swarmEkfUpdateChord(swarmEkf_t* f, const swarmCurve_t* curve,
   swarmCurveDq(curve, th, r, dqi);
   swarmCurveDq(curve, thN, r, dqn);
 
+  // Only the EGO agent's offset is known to this filter. The neighbour's own
+  // dz is unobservable from a scalar range without exchanging state, which the
+  // design forbids, so it is absorbed into the chord noise rather than modelled.
+  // The error this leaves is second order: the chord is near-horizontal, so a
+  // neighbour altitude difference enters as sqrt(h^2 + dz^2) - h ~ dz^2/2h,
+  // i.e. ~2 mm for 10 cm of mismatch on a 1 m chord.
+  qi[2] += f->x[SWARM_EKF_DZ];
+
   const float v[3] = {qi[0] - qn[0], qi[1] - qn[1], qi[2] - qn[2]};
   const float h = sqrtf(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
   if (h < 1e-6f) {
@@ -236,6 +251,9 @@ bool swarmEkfUpdateChord(swarmEkf_t* f, const swarmCurve_t* curve,
   H[idx] = -(e[0]*dqn[0] + e[1]*dqn[1] + e[2]*dqn[2]);
   // Both endpoints share r, so q_i - q_n = r (u_i - u_n) and dh/dr = h/r.
   H[SWARM_EKF_R] = (r > 1e-6f) ? (h / r) : 0.0f;
+  // Near-horizontal chord => e[2] ~ 0, so chords carry almost no dz
+  // information. Included for correctness, not because it contributes.
+  H[SWARM_EKF_DZ] = e[2];
 
   return scalarUpdate(f, H, dist - h, sigma, nisGate);
 }

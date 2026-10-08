@@ -2,3 +2,4 @@ obj-y += swarm_task.o
 obj-y += swarm_phase.o
 obj-y += swarm_curve.o
 obj-y += swarm_ekf.o
+obj-y += swarm_control.o

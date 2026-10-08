@@ -41,6 +41,7 @@
 #include "swarm_curve.h"
 #include "swarm_ekf.h"
 #include "swarm_phase.h"
+#include "swarm_control.h"
 
 #define DEBUG_MODULE "SWARM"
 #include "debug.h"
@@ -49,12 +50,21 @@
 #define DT ((float)UPDATE_PERIOD_MS / 1000.0f)
 
 // Slot convention, matching tools/swarm/setup_swarm.py.
-#define SLOT_A0 0
-#define SLOT_A1 1
-#define SLOT_A2 2
-#define SLOT_LEADER 3
-#define SLOT_FOLLOWER 4
-#define N_ANCHOR_SLOTS 3
+//
+// Slots 0..N_ANCHOR_SLOTS-1 carry anchor ranges, the next two carry the chords
+// to the leader and follower. The anchor count is a compile-time constant
+// rather than a parameter because the slot layout has to agree with the
+// hmLId* configuration pushed from the host; a mismatch shows up as ranges
+// attributed to the wrong role, which is silent and hard to see. Keep this in
+// step with tools/swarm/setup_swarm.py and the crazyflies.yaml hmLId* block.
+#define N_ANCHOR_SLOTS 5
+#define SLOT_LEADER   (N_ANCHOR_SLOTS)        // 5
+#define SLOT_FOLLOWER (N_ANCHOR_SLOTS + 1)    // 6
+
+_Static_assert(SLOT_FOLLOWER < HYBRID_RANGE_SLOTS,
+               "not enough hybrid range slots for 5 anchors plus 2 chords -- "
+               "raise HM_LOG_SLOTS in lpsTdoa3Tag.c and HYBRID_RANGE_SLOTS in "
+               "its header");
 
 static swarmEkf_t ekf;
 
@@ -80,11 +90,12 @@ static struct {
   float th;           // phase [rad]
   float dk, dj;       // formation errors [rad]
   float we, r;
+  float dz;           // vertical offset from the modelled curve [m]
   float phiK, phiJ;   // separations [rad]
   float dTheta;       // filter vs position-derived phase [deg]
   float nis;
-  float sTh, sDk, sDj, sWe, sR;   // 1-sigma, natural units (deg/deg/deg/(rad/s)/m)
-  float pTh, pDk, pDj, pWe, pR;   // raw P diagonal, SI (rad^2 .. m^2)
+  float sTh, sDk, sDj, sWe, sR, sDz;  // 1-sigma, natural units
+  float pTh, pDk, pDj, pWe, pR, pDz;  // raw P diagonal, SI (rad^2 .. m^2)
   uint8_t init;
   uint16_t nAcc, nRej;
   uint16_t seq;       // increments once per publish; pairs the state and
@@ -150,6 +161,7 @@ static void publish(void) {
   out.dj = ekf.x[SWARM_EKF_DJ];
   out.we = ekf.x[SWARM_EKF_WE];
   out.r = ekf.x[SWARM_EKF_R];
+  out.dz = ekf.x[SWARM_EKF_DZ];
 
   swarmEkfSeparations(&ekf, &out.phiK, &out.phiJ);
 
@@ -167,6 +179,7 @@ static void publish(void) {
   out.pDj = ekf.P[SWARM_EKF_DJ][SWARM_EKF_DJ];
   out.pWe = ekf.P[SWARM_EKF_WE][SWARM_EKF_WE];
   out.pR  = ekf.P[SWARM_EKF_R][SWARM_EKF_R];
+  out.pDz = ekf.P[SWARM_EKF_DZ][SWARM_EKF_DZ];
 
   // The same information as one sigma in natural units, for reading by eye:
   // "3 deg" is interpretable, "0.0027 rad^2" is not.
@@ -175,6 +188,7 @@ static void publish(void) {
   out.sDj = sqrtf(out.pDj) * R2D;
   out.sWe = sqrtf(out.pWe);
   out.sR  = sqrtf(out.pR);
+  out.sDz = sqrtf(out.pDz);
 
   out.nis = ekf.lastNis;
   out.init = ekf.initialised ? 1 : 0;
@@ -198,6 +212,7 @@ void appMain(void) {
   // Defaults live in swarm_ekf.c so there is one source of truth; the
   // swarmFilter.q* and p* parameters override them at runtime.
   swarmEkfDefaults(&ekf);
+  swarmControlInit();
 
   TickType_t lastWake = xTaskGetTickCount();
 
@@ -228,6 +243,10 @@ void appMain(void) {
     swarmEkfPredict(&ekf, cfg.wz, DT);
     consumeRanges(curve);
     publish();
+
+    // The controller reads the filter after it has been updated this cycle,
+    // and gates itself on the covariance, so it is safe to call unconditionally.
+    swarmControlUpdate(&ekf, curve, DT);
   }
 }
 
@@ -321,6 +340,17 @@ LOG_ADD(LOG_FLOAT, we, &out.we)
  * variance is swarmCov.r.
  */
 LOG_ADD(LOG_FLOAT, r, &out.r)
+
+/**
+ * @brief Vertical offset from the modelled curve, dz [m]
+ *
+ * How far above (+) or below (-) swarmCurve.cz the filter believes the
+ * vehicle actually is. Near zero once cz matches the flown altitude. It is
+ * ESTIMATED rather than assumed because with a compact anchor set an
+ * unmodelled altitude offset biases theta by 26-43 deg per metre, so 10 cm
+ * would be several degrees of phase error.
+ */
+LOG_ADD(LOG_FLOAT, dz, &out.dz)
 
 /**
  * @brief Publish sequence number, increments once per filter cycle
@@ -478,6 +508,11 @@ LOG_ADD(LOG_FLOAT, r, &out.pR)
  * Compare against swarmFilter.seq to confirm a state and its covariance came
  * from the same filter cycle. See the note there.
  */
+
+/**
+ * @brief Variance of dz [m^2]
+ */
+LOG_ADD(LOG_FLOAT, dz, &out.pDz)
 LOG_ADD(LOG_UINT16, seq, &out.seq)
 
 LOG_GROUP_STOP(swarmCov)
@@ -624,6 +659,15 @@ PARAM_ADD(PARAM_FLOAT, qW, &ekf.qOmega)
 PARAM_ADD(PARAM_FLOAT, qR, &ekf.qR)
 
 /**
+ * @brief Process noise for dz, the vertical offset [m^2/s]
+ *
+ * How fast the filter lets its altitude belief wander. Larger than qR:
+ * altitude is actively controlled and drifts, whereas the orbit radius is
+ * a commanded constant. Default 1e-4.
+ */
+PARAM_ADD(PARAM_FLOAT, qZ, &ekf.qZ)
+
+/**
  * @brief Initial variance of the phase theta [rad^2]
  *
  * How wrong the SEED may be, not how fast the truth drifts -- that is qTh. It
@@ -662,5 +706,12 @@ PARAM_ADD(PARAM_FLOAT, pW, &ekf.p0Omega)
  * 0.09 is a one-sigma of 0.3 m. Takes effect on swarmFilter.rst.
  */
 PARAM_ADD(PARAM_FLOAT, pR, &ekf.p0R)
+
+/**
+ * @brief Initial variance of dz [m^2]
+ *
+ * How wrong swarmCurve.cz might be at reset. Default 0.04 = (0.2 m)^2.
+ */
+PARAM_ADD(PARAM_FLOAT, pZ, &ekf.p0Z)
 
 PARAM_GROUP_STOP(swarmFilter)

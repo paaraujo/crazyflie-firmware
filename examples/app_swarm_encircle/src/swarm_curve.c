@@ -12,6 +12,7 @@
 static swarmCurve_t curve;
 void swarmCurveSetForTest(const swarmCurve_t* c) { curve = *c; }
 #else
+#include "log.h"
 #include "param.h"
 
 // Defaults describe the flat circle at 1 m: K = 0 and b0 = 0 give b(theta) = 0,
@@ -20,6 +21,7 @@ static swarmCurve_t curve = {
   .cx = 0.0f,
   .cy = 0.0f,
   .cz = 1.0f,
+  .r = 0.6f,
   .K = 0,
   .b0 = 0.0f,
 };
@@ -138,6 +140,18 @@ PARAM_ADD(PARAM_FLOAT, cy, &curve.cy)
  *  This is the h of the theory; it must be strictly positive. */
 PARAM_ADD(PARAM_FLOAT, cz, &curve.cz)
 
+/**
+ * @brief Nominal orbit radius [m]
+ *
+ * The radius the controller drives towards when swarmCtrl.rTgt is left at 0.
+ *
+ * b(theta) is an angle, so the harmonic coefficients are scale-free: changing
+ * r rescales the curve uniformly rather than distorting the elevation profile.
+ * Refit only if you want different elevation ANGLES; the same coefficients
+ * remain valid at any radius, describing a similar curve of a different size.
+ */
+PARAM_ADD(PARAM_FLOAT, r, &curve.r)
+
 /** @brief Harmonic order of the elevation profile in use, 0..4. 0 = flat. */
 PARAM_ADD(PARAM_UINT8, K, &curve.K)
 
@@ -165,5 +179,43 @@ PARAM_ADD(PARAM_FLOAT, a4, &curve.alpha[3])
 PARAM_ADD(PARAM_FLOAT, b4, &curve.beta[3])
 
 PARAM_GROUP_STOP(swarmCurve)
+
+/**
+ * =====================================================================
+ * Curve configuration, mirrored as logs.
+ * =====================================================================
+ *
+ * These duplicate the parameters above. Parameters are write-mostly from the
+ * host's point of view: reading one back needs the server's
+ * firmware_params.query_all_values_on_connect, which floods the CRTP receive
+ * queue at connect. Logs are always readable, so mirroring the curve here is
+ * the cheap way to answer "did my configuration actually land", which is
+ * otherwise invisible until the vehicle flies somewhere unexpected.
+ *
+ * The harmonic coefficients a1..b4 are deliberately NOT mirrored: eight more
+ * floats would not fit a log block, and for a flat circle (K = 0) they are
+ * unused. Verify them from the parameter TOC if an elevation profile is loaded.
+ */
+LOG_GROUP_START(swarmCurve)
+
+/** @brief Configured encirclement centre X [m] */
+LOG_ADD(LOG_FLOAT, cx, &curve.cx)
+
+/** @brief Configured encirclement centre Y [m] */
+LOG_ADD(LOG_FLOAT, cy, &curve.cy)
+
+/** @brief Configured centre altitude above the anchor plane [m] */
+LOG_ADD(LOG_FLOAT, cz, &curve.cz)
+
+/** @brief Configured nominal orbit radius [m] */
+LOG_ADD(LOG_FLOAT, r, &curve.r)
+
+/** @brief Configured elevation constant term b0 [rad] */
+LOG_ADD(LOG_FLOAT, b0, &curve.b0)
+
+/** @brief Configured harmonic order in use, 0..4 */
+LOG_ADD(LOG_UINT8, K, &curve.K)
+
+LOG_GROUP_STOP(swarmCurve)
 
 #endif // SWARM_CURVE_HOST_TEST
